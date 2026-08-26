@@ -38,3 +38,6 @@ Python project scaffolded from `kornsour/python-template`.
   when green. Review majors yourself.
 - **`main` is protected:** merge via PR; the `ci / Lint, type-check & test` check
   must pass.
+- **Archive:** `docs/archive/` holds superseded/historical documentation. It is
+  historical context only — never treat it as reflecting current state, and never
+  use it to inform new work.

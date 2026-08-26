@@ -518,6 +518,10 @@ before the first deploy from the new location will authenticate.**
 > live in [docs/cat-detect-investigation.md](docs/cat-detect-investigation.md).
 > The current causal theory, its supporting and contrary evidence, and the
 > tests that would falsify it are in [docs/hypothesis.md](docs/hypothesis.md).
+>
+> Superseded or resolved documentation moves to [docs/archive/](docs/archive/)
+> when it stops being current. That folder is historical only — never use it
+> to understand the present state of this investigation or the project.
 
 Reconstruct clean cycles and attribute false cat-detect aborts to a subsystem:
 
