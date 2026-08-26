@@ -1,0 +1,33 @@
+# Diagnostic capture plus the autoreset watchdog, sharing one SQLite volume so
+# interventions land in the same timeline as the readings they interrupt.
+#
+# Credentials come from a gitignored .env holding WHISKER_USERNAME and
+# WHISKER_PASSWORD. Copy .env.example to get started.
+services:
+  capture:
+    build: .
+    image: lr4-diagnostics
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - lr4-data:/data
+    command:
+      - capture
+      - --database=/data/lr4-diagnostics.sqlite
+
+  autoreset:
+    build: .
+    image: lr4-diagnostics
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - lr4-data:/data
+    # Drop --arm to run detection-only: the watchdog will log and record every
+    # decision without sending a single command.
+    command:
+      - autoreset
+      - --database=/data/lr4-diagnostics.sqlite
+      - --arm
+
+volumes:
+  lr4-data:

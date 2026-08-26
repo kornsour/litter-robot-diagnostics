@@ -1,0 +1,26 @@
+# Required. The state bucket name embeds the AWS account ID, so it is not
+# committed anywhere in the tree. Pass the same value to
+# `tofu init -backend-config="bucket=..."`.
+tf_state_bucket = "lr4-watchdog-tofu-state-123456789012"
+
+# Required. OWNER/REPO permitted to assume the deploy role via GitHub OIDC.
+# Must match the repository exactly, or the role cannot be assumed.
+github_repository = "your-org/litter-robot-diagnostics"
+
+# Create the secret outside OpenTofu so credentials never enter state or Git.
+whisker_secret_arn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:lr4-whisker"
+
+# Keep false until detection-only CloudWatch/DynamoDB evidence has been reviewed.
+armed = false
+
+# Notified when the unit is stuck, when the watchdog stands down, when the waste
+# drawer needs emptying, and when the scheduled check is failing. Worth setting
+# before arming, not after: the stuck alarm is what tells you the box needs you
+# while the watchdog is still passive.
+alarm_email = "you@example.com"
+
+# Waste-drawer thresholds. The gap between warn and clear is hysteresis for a
+# noisy DFI ToF, not slack; narrowing it re-sends the mail on every swing.
+# drawer_warn_percent        = 85
+# drawer_clear_percent       = 60
+# drawer_consecutive_samples = 5

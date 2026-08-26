@@ -1,0 +1,81 @@
+name: Deploy watchdog
+
+on:
+  # Settings that live outside the tree — the alert address, the armed flag —
+  # change without any file changing, so a path-filtered push trigger alone
+  # leaves no way to apply them short of an empty commit or a re-run.
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/deploy-watchdog.yml"
+      - "infra/**"
+      - "scripts/package-lambda.sh"
+      - "src/**"
+      - "pyproject.toml"
+      - "uv.lock"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: watchdog-deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Matches the runner selection used by the org's shared reusable workflows,
+    # so there is one flip mechanism rather than two. On a public repo the
+    # `private` clause is false and this always resolves to a GitHub-hosted
+    # runner — which is both the free tier and the only safe answer, since a
+    # fork PR on a public repo must never reach a self-hosted runner.
+    runs-on: ${{ vars.USE_SELF_HOSTED_RUNNER == 'true' && github.event.repository.private && 'self-hosted' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - uses: opentofu/setup-opentofu@v2
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          # Contains the AWS account ID, so it is a repository secret rather
+          # than a literal. Not a credential — assuming it still requires an
+          # OIDC token whose `sub` matches the role's trust policy.
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-west-2' }}
+      - name: Build Lambda package
+        run: bash scripts/package-lambda.sh
+      - name: Deploy OpenTofu configuration
+        working-directory: infra
+        env:
+          TF_VAR_whisker_secret_arn: ${{ secrets.TF_VAR_WHISKER_SECRET_ARN }}
+          # Optional. Unset leaves the alert topic in place with no subscriber,
+          # so the alarms fire into nothing until it is configured.
+          TF_VAR_alarm_email: ${{ secrets.TF_VAR_ALARM_EMAIL }}
+          # Whether the watchdog may send commands to the device. A repository
+          # *variable*, not a secret, deliberately: whether a machine that moves
+          # is allowed to move should be readable at a glance, not hidden.
+          #
+          # This has to be plumbed at all because CI is the last writer. Arming
+          # by a local `tofu apply` would be silently reverted to false by the
+          # next merge that touches src/ or infra/ — safe, but a confusing way
+          # to discover your watchdog stopped acting. Must be exactly `true` or
+          # `false`; anything else fails the apply rather than guessing.
+          TF_VAR_armed: ${{ vars.WATCHDOG_ARMED || 'false' }}
+          # The state bucket name embeds the AWS account ID. It is needed twice:
+          # once by `tofu init` to reach the backend, once by the deploy role's
+          # own IAM policy, which grants access to that bucket by ARN.
+          TF_VAR_tf_state_bucket: ${{ secrets.TF_STATE_BUCKET }}
+          # Pins the OIDC trust policy to this repository. Taken from context so
+          # that moving or renaming the repo cannot silently leave the role
+          # trusting the old path.
+          TF_VAR_github_repository: ${{ github.repository }}
+          TF_VAR_github_default_branch: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          # A backend block cannot take variables, so the bucket and lock table
+          # are supplied here instead of being committed. See infra/main.tf.
+          tofu init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE || 'lr4-watchdog-tofu-lock' }}"
+          tofu apply -auto-approve

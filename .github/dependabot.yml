@@ -1,0 +1,38 @@
+version: 2
+updates:
+  # Python dependencies (pyproject.toml). Minor/patch are batched into a single
+  # grouped PR — one CI run per week instead of one per package — and the
+  # auto-merge workflow merges them once checks pass. Majors come as individual
+  # PRs for manual review.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "kornsour"
+    labels:
+      - "dependencies"
+    groups:
+      python-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions pinned in workflows. Grouped so all action bumps arrive as one
+  # PR, keeping CI runs (and minutes) to a minimum.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"

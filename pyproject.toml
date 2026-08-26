@@ -1,0 +1,57 @@
+[project]
+name = "litter-robot-diagnostics"
+version = "0.1.0"
+description = "Read-only, local diagnostic capture for Whisker Litter-Robot 4 devices."
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+authors = [{ name = "Andrew Kaiserauer" }]
+classifiers = [
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "aiohttp>=3.11",
+    "boto3>=1.35",
+    "keyring>=25.6",
+    # Already installed transitively by pylitterbot, but declared because
+    # `lambda_handler` imports TokenVerificationException from it directly to
+    # recover from an expired stored token.
+    "pycognito>=2024.5.1",
+    "pylitterbot>=2025.6.2,<2026",
+    "typing-extensions>=4.12",
+]
+
+[project.scripts]
+lr4-diagnostics = "lr4_diagnostics.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.15.22",
+    "pyright>=1.1.411",
+    "pre-commit>=3.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lr4_diagnostics"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.14"
+typeCheckingMode = "basic"
+reportMissingImports = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

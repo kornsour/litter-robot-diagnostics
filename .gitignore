@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+dist/
+build/
+
+# Native / compiled extensions
+*.so
+
+# Environments & secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Local diagnostic output
+logs/
+build/
+infra/**/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/*.tfplan
+infra/**/*.tfstate
+infra/**/*.tfstate.*
+infra/**/*.tfplan
+infra/terraform.tfvars
+# `access/` is a separate root module applied by hand; see access/README.md.
+# The provider lock file is deliberately *not* ignored — it should be committed.
+access/**/.terraform/
+access/**/*.tfstate
+access/**/*.tfstate.*
+access/**/*.tfplan
+access/terraform.tfvars
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Device identifiers (full serial, MAC) — never commit; see
+# docs/cat-detect-investigation.md
+*.local.md

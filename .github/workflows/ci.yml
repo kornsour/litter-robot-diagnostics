@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref, so we
+# never burn minutes finishing a run that's already superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    # Centralized, standardized CI shared across the Python template-derived
+    # repos. See github.com/kornsour/gh-automation.
+    uses: kornsour/gh-automation/.github/workflows/python-ci.yml@main
+    with:
+      python-version: "3.14"
+      validate-opentofu: true
