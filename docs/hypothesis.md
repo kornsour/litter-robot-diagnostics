@@ -1,6 +1,10 @@
 # Current hypothesis: progressive load-cell drift in the base
 
-**Stated 2026-07-28. Confidence: moderate-to-high, not proven.**
+**Stated 2026-07-28. Confidence: high as of 2026-08-28** — the predicted
+decay-and-relapse of the 07-27 re-zero has now been observed (see
+"Decay-and-relapse confirmed" below), which is the first case in this
+investigation of a *prediction* being checked against new data rather than
+supporting evidence assembled after the fact.
 
 For the underlying evidence and methodology see
 [cat-detect-investigation.md](cat-detect-investigation.md). This document states
@@ -60,19 +64,27 @@ Ordered by strength.
    `CatDetectStuckWeight` at 2026-06-30T20:38:15Z. Not an inference — the
    manufacturer's own event name identifies stuck *weight*.
 
-2. **Recorded max weight escalates past physical possibility.**
+2. **Recorded max weight escalates past physical possibility — and now relapses
+   right on schedule with the predicted decay.**
 
-   | Week | maxWeight | minWeight |
-   |---|---|---|
-   | 07-01 .. 07-07 | 11.50 | 8.09 |
-   | 07-08 .. 07-14 | 11.61 | 8.09 |
-   | 07-15 .. 07-21 | 19.48 | 7.87 |
-   | 07-22 .. 07-28 | **22.65** | 7.63 |
+   | Week | maxWeight | minWeight | Note |
+   |---|---|---|---|
+   | 07-01 .. 07-07 | 11.50 | 8.09 | baseline |
+   | 07-08 .. 07-14 | 11.61 | 8.09 | baseline |
+   | 07-15 .. 07-21 | 19.48 | 7.87 | drift emerging |
+   | 07-22 .. 07-28 | **22.65** | 7.63 | drift, pre-re-zero |
+   | 08-01 .. 08-07 | 11.86 | 7.42 | post-re-zero, normal |
+   | 08-08 .. 08-14 | 12.02 | 5.70 | post-re-zero, normal |
+   | 08-15 .. 08-21 | 12.38 | 5.76 | post-re-zero, normal |
+   | 08-22 .. 08-28 | **21.02** | 7.57 | **drift relapsed** |
 
    SmartWeight has never attributed more than 11.53 lb to a pet profile, and
-   both cats at once caps near 19.49 lb. The final week exceeds any load the
-   household can produce. A climbing maximum against a flat minimum is drift,
-   not heavier cats.
+   both cats at once caps near 19.49 lb. Both the 07-22 .. 07-28 and 08-22 ..
+   08-28 weeks exceed any load the household can produce. A climbing maximum
+   against a flat minimum is drift, not heavier cats. Note `minWeight` also
+   dipped to 5.70-5.76 lb through the normal weeks, below the 7.4-8.1 lb range
+   seen elsewhere — plausibly the same drift wandering negative rather than a
+   third signal, but not otherwise explained.
 
 3. **Individual readings fall outside both cats, in both directions.** 4.9 lb on
    2026-06-30 (31 minutes before the stuck-weight event, matching the 30-minute
@@ -101,10 +113,45 @@ Ordered by strength.
 | 07-01 .. 07-14 | Weekly maxWeight normal (11.50, 11.61) |
 | 07-15 onward | maxWeight anomalous (19.48, then 22.65) |
 | 07-20 onward | Detailed capture: 17 idle latches, 105 aborts across 59 cycles |
+| 07-27 ~18:30 | Scale recalibration: double-press Reset from home |
+| 08-01 .. 08-21 | Weekly maxWeight normal again (11.86, 12.02, 12.38) |
+| 08-22 .. 08-28 | **maxWeight relapses to 21.02**; worst single cycle of the whole capture (8 aborts) lands 08-28 07:09, inside the relapsed week |
 
-Consistent with a component degrading over weeks rather than failing outright.
+Consistent with a component degrading over weeks rather than failing outright,
+and now with a re-zero whose relief measurably decays rather than holding.
 
 ---
+
+## Decay-and-relapse confirmed (2026-08-28)
+
+[hypothesis.md's own prediction #2](#predictions), stated 2026-07-28, was:
+
+> The Reset re-zero of 2026-07-27 gives temporary relief that decays within
+> days, because re-taring corrects an offset but not ongoing drift.
+
+A capture gap means the actual data cannot distinguish "days" from "weeks" —
+nothing was recorded between 07-30 and 08-21 — but the shape is exactly what
+was predicted: three clean weeks (08-01 .. 08-21, maxWeight 11.86-12.38, in
+the same range as the pre-drift baseline) followed by a relapse to 21.02 lb
+in the week of 08-22 .. 08-28, landing in the same physically-impossible
+territory as the pre-re-zero peak (22.65). The relapsed week also produced
+the single worst cycle in the entire capture — 8 aborts in one cycle, on
+08-28 at 07:09 — consistent with abort severity tracking weight-drift
+magnitude (prediction #4).
+
+This is the first time a *stated prediction* has been checked against data
+collected after the fact, rather than a piece of evidence assembled in
+support of the hypothesis after the fact. It does not distinguish this
+hypothesis from "a mechanical tare/offset that re-drifts over time" in
+general — it does not, on its own, rule out the competing "mechanical or
+placement" explanation (§ below) — but a one-time miscalibration that simply
+needed correcting would not be expected to relapse on its own weeks later.
+Confidence is raised accordingly, from moderate-to-high to high.
+
+**Practical corollary**: the re-zero is a real but temporary mitigation, on
+roughly a 3-4 week relief cycle so far (one data point; not yet enough to
+call it a fixed interval). See "Practical consequence" below for what that
+implies for repeating it versus replacing the base.
 
 ## What this does not explain
 
@@ -150,12 +197,25 @@ help — but the feet have not been explicitly inspected.
 
 If the hypothesis holds:
 
-1. Weekly `maxWeight` keeps climbing beyond 22.65 lb.
-2. The Reset re-zero of 2026-07-27 gives temporary relief that decays within
-   days, because re-taring corrects an offset but not ongoing drift.
+1. Weekly `maxWeight` keeps climbing beyond 22.65 lb. **Not confirmed as
+   stated** — it reset to baseline after the 07-27 re-zero rather than
+   continuing to climb, then relapsed to 21.02 (see prediction 2). Climbing
+   without bound was the wrong shape; decay-then-relapse was the right one.
+2. **CONFIRMED 2026-08-28.** The Reset re-zero of 2026-07-27 gives temporary
+   relief that decays, because re-taring corrects an offset but not ongoing
+   drift. Observed: relief held for three full weeks (08-01 .. 08-21,
+   maxWeight 11.86-12.38) before relapsing to 21.02 in the week of 08-22 ..
+   08-28. The capture gap 07-30..08-21 means the true decay window could be
+   anywhere from days to ~3 weeks — the original "within days" guess was
+   likely too fast, but the decay-then-relapse shape was right. See
+   "Decay-and-relapse confirmed" above.
 3. A deliberate weight-step test reproduces the latch on demand: place a known
-   ~5 lb load, remove it, and the unit fails to release.
-4. Latch frequency tracks drift magnitude, so both worsen together.
+   ~5 lb load, remove it, and the unit fails to release. **Still not run.**
+4. Latch frequency tracks drift magnitude, so both worsen together. **Weakly
+   consistent**: the relapsed week (08-22 .. 08-28) produced the single worst
+   cycle in the whole capture (8 aborts), though this tracks abort severity
+   more directly than latch frequency, which was not separately recomputed
+   for this window.
 
 If instead the aborts are optical, replacing the laser board clears the aborts
 while the latches continue unchanged.
@@ -171,7 +231,9 @@ while the latches continue unchanged.
 - `catDetectStuckLaser` or `isLaserDirty` appearing → optical fault confirmed as
   at least a contributor.
 - Latches stopping after the Reset re-zero and staying stopped → simple tare
-  error rather than progressive drift.
+  error rather than progressive drift. **Already decided against**: relief
+  held for ~3 weeks then relapsed (08-22 .. 08-28, maxWeight 21.02), so this
+  reads as progressive drift, not a one-time tare error.
 
 ---
 
@@ -180,6 +242,12 @@ while the latches continue unchanged.
 The scale is in the **base**, a ~$449 part. The laser board is ~$50. Given the
 cost gap, establishing which component is at fault before purchasing matters
 more than usual, and the free weight-step test is the highest-value next action.
+
+The re-zero (double-press Reset from home) is a free, ~10-second action that
+now has one confirmed data point: it holds for roughly 3-4 weeks before the
+drift relapses. Until the base is replaced or the weight-step test points
+elsewhere, repeating the re-zero on that rough cadence is a reasonable
+stopgap — it is not a fix and the relapse pattern is expected to continue.
 
 The unit is roughly 3.4 years old and out of warranty (1 year standard,
 extendable to 3), and Whisker does not offer out-of-warranty repair, so the

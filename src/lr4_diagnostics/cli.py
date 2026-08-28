@@ -102,6 +102,39 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     autoreset.add_argument(
+        "--arm-rezero",
+        action="store_true",
+        help=(
+            "Enable the proactive scale re-zero (double Reset from an idle "
+            "unit when weekly maxWeight exceeds --rezero-weight-ceiling). "
+            "Has no effect unless --arm is also passed. Separate from --arm "
+            "because, unlike every other command this watchdog sends, the "
+            "idle double-press has never been independently verified via the "
+            "API -- see the autoreset module docstring."
+        ),
+    )
+    autoreset.add_argument(
+        "--rezero-weight-ceiling",
+        type=float,
+        default=RecoveryPolicy.rezero_weight_ceiling,
+        help=(
+            "Weekly maxWeight (lb) at or above which drift is assumed rather "
+            "than a heavy cat (default: %(default)s)."
+        ),
+    )
+    autoreset.add_argument(
+        "--rezero-poll-interval",
+        type=float,
+        default=RecoveryPolicy.rezero_poll_interval,
+        help="Seconds between weekly weight-summary checks.",
+    )
+    autoreset.add_argument(
+        "--rezero-cooldown",
+        type=float,
+        default=RecoveryPolicy.rezero_cooldown,
+        help="Minimum seconds between proactive re-zero attempts.",
+    )
+    autoreset.add_argument(
         "--latch-grace",
         type=float,
         default=RecoveryPolicy.latch_grace,
@@ -357,11 +390,17 @@ def _autoreset(args: argparse.Namespace) -> int:
         tof_clear_floor=args.tof_clear_floor,
         require_clear_tof=not args.skip_tof_check,
         poll_interval=args.poll_interval,
+        rezero_weight_ceiling=args.rezero_weight_ceiling,
+        rezero_poll_interval=args.rezero_poll_interval,
+        rezero_cooldown=args.rezero_cooldown,
         armed=args.arm,
+        rezero_armed=args.arm_rezero,
         duration=args.duration,
     )
     config = AutoResetConfig(database=args.database, policy=policy)
     mode = "ARMED — commands will be sent" if policy.armed else "detection only"
+    if policy.armed and policy.rezero_armed:
+        mode += "; proactive re-zero ARMED"
     print(f"Watching for stuck cat-sensor states ({mode}). Press Ctrl-C to stop.")
     result = asyncio.run(run_autoreset(username, config))
     print(
