@@ -356,6 +356,33 @@ about. Codes observed on this unit:
 | `DC_BONNET_OFF` | Yellow flashing | Bonnet removed (seen during maintenance) |
 | `DC_USER_PAUSE` | — | Cycle paused |
 | `DCX_LAMP_TEST`, `DCX_REFRESH` | — | Power-up self-test / refresh |
+| `DCX_CONFIRM` | **Solid blue** (owner-observed) | Seen once, ~1h after an idle double-Reset (see below); resolved on its own |
+
+### `DCX_CONFIRM` / `CAT_DETECT_RESET_CANCELLED` after an idle double-Reset
+
+2026-08-28: the new proactive scale re-zero (`autoreset --arm-rezero`, see
+`autoreset.py`) fired for the first time, dispatching two API `shortResetPress`
+calls back-to-back on an idle, healthy unit (weekly `maxWeight` had hit 21.02
+lb — see `hypothesis.md`). Both calls returned without error.
+
+A state pull about an hour later showed `displayCode=DCX_CONFIRM` and
+`catDetect=CAT_DETECT_RESET_CANCELLED` — neither previously observed in this
+capture. `robotStatus` still read `ROBOT_IDLE`, so nothing about it looked
+stuck to the watchdog's own gates, but the codes themselves read like a
+confirmation-pending or cancelled-recalibration state rather than a clean
+`DC_MODE_IDLE`. This is the first real evidence that the idle double-press
+does something via the API, though not yet clear exactly what — the module
+docstring already flagged that this specific sequence had never been
+independently verified, only assumed from Whisker's physical-button
+documentation.
+
+Checked in person the same day: light bar solid blue, no alert in the
+Whisker app. So whatever `DCX_CONFIRM`/`CAT_DETECT_RESET_CANCELLED` meant, it
+either cleared on its own or was never visible/actionable at the unit.
+Treat both codes as unclassified rather than benign — one clean resolution
+is not enough to rule out that they matter under different circumstances.
+Whether the re-zero itself actually took will only be answerable once the
+week starting 2026-08-29 has enough data for a `maxWeight` reading.
 
 ### The blue + partial yellow pattern points at the scale
 

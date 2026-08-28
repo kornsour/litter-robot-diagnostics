@@ -44,6 +44,40 @@ Safety rationale, since a reset can start the globe turning:
 Every assessment and attempt is recorded to the same store as the diagnostic
 capture, under source ``intervention``, so a later analysis can exclude or
 annotate windows the watchdog interfered with.
+
+**Proactive scale re-zero.** A second, independent mechanism watches the
+weekly ``getLitterRobot4Summary`` weight data (see
+``docs/hypothesis.md``) rather than real-time state, and double-presses Reset
+from an idle unit -- the same recalibration Whisker documents for the
+physical button -- when ``maxWeight`` exceeds a physically-impossible
+ceiling for this household. This targets scale drift *before* it necessarily
+produces a latch or a stall, on the theory (not yet certain -- see the doc)
+that the drift is progressive and a fresh re-zero holds for weeks before
+relapsing.
+
+This is a genuinely different risk shape from the recovery above, and is
+called out explicitly rather than folded silently into the same gate:
+
+* The recovery above only ever presses Reset on a unit that is *already*
+  stuck -- there was nothing to lose by trying. A proactive re-zero fires on
+  a unit that looks perfectly healthy in real time; the only evidence is a
+  slow-moving weekly aggregate. Being wrong here means recalibrating a scale
+  that did not need it, not leaving a fault unaddressed.
+* Unlike every other command this module sends, **the idle double-press has
+  never been independently verified via the API.** ``probe-reset`` only ever
+  measured Reset against a *running* cycle; nobody has confirmed that two
+  ``shortResetPress`` calls from an idle unit reproduce what the physical
+  button does, or that maxWeight actually moves afterwards. The existing
+  recovery logic earned trust the hard way, by measuring instead of assuming
+  (see ``docs/cat-detect-investigation.md``, "What the remote commands
+  actually do"); this mechanism does not have that measurement yet and is
+  built on the documented button behavior as an explicit, disclosed
+  assumption.
+* It therefore requires its own flag, ``--arm-rezero``, on top of ``--arm``:
+  passing ``--arm`` alone enables the existing stuck-state recovery but not
+  this. It still only ever fires on an idle, healthy, bonnet-secure unit with
+  a quiet activity stream, and it will not re-fire for a week it has already
+  acted on.
 """
 
 from __future__ import annotations
@@ -64,6 +98,7 @@ from pylitterbot.event import EVENT_UPDATE
 
 from .auth import load_token, resolve_password, save_token
 from .capture import _isolated_botocore_configuration
+from .queries import GraphQLQueryError, fetch_summary
 from .redact import pseudonym
 from .sensors import number
 from .store import EventStore
@@ -95,6 +130,11 @@ CAT_ACTIVITY_VALUES = frozenset({"catWeight", "robotStatusCatDetect", "robotCycl
 IDLE_LATCH = "idle-latch"
 CYCLE_STALL = "cycle-stall"
 CYCLE_OVERRUN = "cycle-overrun"
+#: Weekly weight summary reads outside any plausible household load. Distinct
+#: from the three reasons above: those are read off real-time device state,
+#: this one is read off a slow-moving weekly aggregate, and it can fire on a
+#: unit that looks perfectly healthy right now.
+SCALE_DRIFT = "scale-drift"
 
 #: The two commands this module may send. `RESET` is `shortResetPress`, which
 #: is a pause/resume toggle mid-cycle rather than a "return home" command;
@@ -160,8 +200,24 @@ class RecoveryPolicy:
     tof_clear_floor: float = 400.0
     require_clear_tof: bool = True
     poll_interval: float = 30.0
+    #: Weekly ``maxWeight`` at or above this is outside what this household's
+    #: cats can physically produce (two cats together cap near 19.49 lb; see
+    #: docs/hypothesis.md) and is treated as drift rather than a heavy cat.
+    rezero_weight_ceiling: float = 19.5
+    #: How often to re-check the weekly weight summary. Weekly data moves
+    #: slowly, so this is deliberately coarse compared to `poll_interval`.
+    rezero_poll_interval: float = 3600.0
+    #: Minimum gap between proactive re-zero attempts. Independent of
+    #: `cooldown`, which paces stuck-state *recovery* -- re-zero is not a
+    #: response to a stuck state and must not share or consume that budget.
+    rezero_cooldown: float = 21600.0
     #: When false the watchdog only logs and records what it would have done.
     armed: bool = False
+    #: Second, explicit gate for the proactive re-zero specifically. `armed`
+    #: alone enables the existing stuck-state recovery but not this -- see
+    #: the module docstring for why this command path is held to a higher
+    #: bar. Has no effect unless `armed` is also true.
+    rezero_armed: bool = False
     duration: float | None = None
 
     def validate(self) -> None:
@@ -194,6 +250,12 @@ class RecoveryPolicy:
             raise ValueError("ToF clear floor cannot be negative")
         if self.duration is not None and self.duration <= 0:
             raise ValueError("duration must be greater than zero")
+        if self.rezero_weight_ceiling <= 0:
+            raise ValueError("rezero weight ceiling must be greater than zero")
+        if self.rezero_poll_interval < 300:
+            raise ValueError("rezero poll interval must be at least 300 seconds")
+        if self.rezero_cooldown < 3600:
+            raise ValueError("rezero cooldown must be at least 3600 seconds")
 
 
 @dataclass(frozen=True)
@@ -269,6 +331,15 @@ class Observation:
 
 
 @dataclass(frozen=True)
+class WeightSample:
+    """One weekly weight-summary reading, reduced to what drift detection needs."""
+
+    at: float
+    week_start: str | None
+    max_weight: float | None
+
+
+@dataclass(frozen=True)
 class Assessment:
     """The watchdog's verdict on one observation."""
 
@@ -314,6 +385,10 @@ class Watchdog:
         self._consecutive_failures = 0
         self._bonnet_secure = False
         self._awaiting_verdict = False
+        self._last_observation: Observation | None = None
+        self._last_rezero_week: str | None = None
+        self._last_rezero_attempt: float | None = None
+        self._rezero_consecutive_failures = 0
 
     @property
     def consecutive_failures(self) -> int:
@@ -324,6 +399,21 @@ class Watchdog:
     def escalated(self) -> bool:
         """Whether repeated failures have taken the watchdog out of service."""
         return self._consecutive_failures >= self.policy.max_consecutive_failures
+
+    @property
+    def rezero_consecutive_failures(self) -> int:
+        """How many proactive re-zero dispatches have failed back to back."""
+        return self._rezero_consecutive_failures
+
+    @property
+    def rezero_escalated(self) -> bool:
+        """Whether repeated re-zero failures have taken that mechanism out of service.
+
+        Tracked separately from `escalated`: a re-zero dispatch failure says
+        something about the command channel, not about whether the unit is
+        stuck, and the two should not silently stand each other down.
+        """
+        return self._rezero_consecutive_failures >= self.policy.max_consecutive_failures
 
     def note_cat_activity(self, at: float | None = None) -> None:
         """Record that the box saw real interaction, refreshing the quiet period.
@@ -386,6 +476,11 @@ class Watchdog:
             # A recovery is judged across invocations, so the outstanding
             # verdict has to survive with the timers it will be judged against.
             "awaiting_verdict": self._awaiting_verdict,
+            # Without these, a restarted scheduled runtime would forget it
+            # already re-zeroed for the current week and re-fire immediately.
+            "last_rezero_week": self._last_rezero_week,
+            "last_rezero_attempt": self._last_rezero_attempt,
+            "rezero_consecutive_failures": self._rezero_consecutive_failures,
         }
 
     def restore(self, state: dict[str, object]) -> None:
@@ -413,9 +508,17 @@ class Watchdog:
         )
         self._bonnet_secure = state.get("bonnet_secure") is True
         self._awaiting_verdict = state.get("awaiting_verdict") is True
+        week = state.get("last_rezero_week")
+        self._last_rezero_week = week if isinstance(week, str) else None
+        self._last_rezero_attempt = _optional_number(state.get("last_rezero_attempt"))
+        rezero_failures = state.get("rezero_consecutive_failures")
+        self._rezero_consecutive_failures = (
+            int(rezero_failures) if isinstance(rezero_failures, int) and rezero_failures >= 0 else 0
+        )
 
     def assess(self, observation: Observation) -> Assessment:
         """Fold one observation into the state machine and return a verdict."""
+        self._last_observation = observation
         self._track_service(observation)
         self._track_latch(observation)
         self._track_progress(observation)
@@ -554,6 +657,72 @@ class Watchdog:
         while self._attempts and at - self._attempts[0] > 3600.0:
             self._attempts.popleft()
 
+    def assess_drift(self, sample: WeightSample) -> Assessment:
+        """Decide whether a weekly weight summary warrants a proactive re-zero.
+
+        Independent of `assess`: this reads a slow-moving weekly aggregate
+        rather than real-time state, and can return `should_act=True` while
+        the unit looks perfectly healthy on every other signal.
+        """
+        if sample.max_weight is None or sample.max_weight < self.policy.rezero_weight_ceiling:
+            return Assessment(stuck=False)
+        if sample.week_start is not None and sample.week_start == self._last_rezero_week:
+            return Assessment(
+                stuck=True,
+                reason=SCALE_DRIFT,
+                stuck_for=0.0,
+                should_act=False,
+                blocked_by=f"already re-zeroed for week {sample.week_start}",
+            )
+        blocked_by = self._blocked_by_drift(sample)
+        return Assessment(
+            stuck=True,
+            reason=SCALE_DRIFT,
+            stuck_for=0.0,
+            should_act=blocked_by is None,
+            blocked_by=blocked_by,
+        )
+
+    def _blocked_by_drift(self, sample: WeightSample) -> str | None:
+        """Return the first gate that forbids a proactive re-zero, or None."""
+        if self._last_observation is None:
+            return "no real-time observation yet"
+        if not self._last_observation.bonnet_secure:
+            if self._last_observation.bonnet_removed is None:
+                return "bonnet state unavailable"
+            return "bonnet removed, someone is at the unit"
+        if not self._last_observation.is_healthy:
+            return "unit not idle at home"
+
+        if self.rezero_escalated:
+            failures = self._rezero_consecutive_failures
+            return f"rezero escalated after {failures} consecutive failures"
+
+        if self._last_rezero_attempt is not None:
+            since = sample.at - self._last_rezero_attempt
+            if since < self.policy.rezero_cooldown:
+                return f"rezero cooldown, {self.policy.rezero_cooldown - since:.0f}s remaining"
+
+        if self._last_cat_activity is not None:
+            quiet_for = sample.at - self._last_cat_activity
+            if quiet_for < self.policy.quiet_period:
+                return f"cat activity {quiet_for:.0f}s ago"
+
+        return None
+
+    def note_rezero_attempt(self, week_start: str | None, *, at: float | None = None) -> None:
+        """Record that a re-zero was attempted for a given summary week."""
+        self._last_rezero_attempt = self._now() if at is None else at
+        self._last_rezero_week = week_start
+
+    def note_rezero_failed(self) -> None:
+        """Record a re-zero dispatch that raised rather than completing."""
+        self._rezero_consecutive_failures += 1
+
+    def note_rezero_succeeded(self) -> None:
+        """Record a re-zero that dispatched both presses without error."""
+        self._rezero_consecutive_failures = 0
+
 
 @dataclass
 class AutoResetConfig:
@@ -644,7 +813,9 @@ async def run_autoreset(username: str, config: AutoResetConfig) -> AutoResetResu
                     )
                 )
 
-            return await _watch_loop(robots, watchdogs, updates, activity_updates, store, policy)
+            return await _watch_loop(
+                account, robots, watchdogs, updates, activity_updates, store, policy
+            )
         finally:
             for task in activity_tasks:
                 task.cancel()
@@ -656,6 +827,7 @@ async def run_autoreset(username: str, config: AutoResetConfig) -> AutoResetResu
 
 
 async def _watch_loop(
+    account: Account,
     robots: list[LitterRobot4],
     watchdogs: dict[str, Watchdog],
     updates: asyncio.Queue[tuple[LitterRobot4, dict[str, Any]]],
@@ -665,9 +837,11 @@ async def _watch_loop(
 ) -> AutoResetResult:
     started = monotonic()
     next_poll = started
+    next_rezero_check = started
     attempts = 0
     recoveries = 0
     announced: dict[str, str | None] = {}
+    announced_drift: dict[str, str | None] = {}
 
     while True:
         now = monotonic()
@@ -728,6 +902,51 @@ async def _watch_loop(
                     "human intervenes at the unit.",
                     watchdog.consecutive_failures,
                 )
+
+        if now >= next_rezero_check:
+            next_rezero_check = now + policy.rezero_poll_interval
+            for robot in robots:
+                watchdog = watchdogs[robot.serial]
+                try:
+                    rows = await fetch_summary(account.session, robot.serial)
+                except GraphQLQueryError as exc:
+                    _LOGGER.warning(
+                        "Weight summary fetch failed (%s); will retry.", type(exc).__name__
+                    )
+                    continue
+
+                sample = _latest_weight_sample(rows, monotonic())
+                if sample is None:
+                    continue
+
+                drift_assessment = watchdog.assess_drift(sample)
+                _announce(robot, drift_assessment, announced_drift)
+                if not drift_assessment.stuck:
+                    continue
+
+                _record_drift(store, robot, "drift_assessment", sample, drift_assessment, policy)
+                log_stuck(drift_assessment, policy)
+                if not drift_assessment.should_act:
+                    continue
+
+                attempts += 1
+                watchdog.note_rezero_attempt(sample.week_start, at=monotonic())
+                rezero_succeeded = await _rezero_scale(
+                    robot, sample, drift_assessment, store, policy
+                )
+                if not (policy.armed and policy.rezero_armed):
+                    continue
+                if rezero_succeeded:
+                    recoveries += 1
+                    watchdog.note_rezero_succeeded()
+                else:
+                    watchdog.note_rezero_failed()
+                if watchdog.rezero_escalated:
+                    _LOGGER.error(
+                        "WATCHDOG_REZERO_ESCALATED failures=%d; standing down on "
+                        "proactive re-zero until a human intervenes at the unit.",
+                        watchdog.rezero_consecutive_failures,
+                    )
 
 
 async def _recover(
@@ -803,6 +1022,58 @@ async def _recover(
     steps["succeeded"] = succeeded
     _record(store, robot, "recovery", observation, assessment, policy, extra=steps)
     _LOGGER.info("Recovery %s.", "succeeded" if succeeded else "did not clear the fault")
+    return succeeded
+
+
+async def _rezero_scale(
+    robot: LitterRobot4,
+    sample: WeightSample,
+    assessment: Assessment,
+    store: InterventionStore,
+    policy: RecoveryPolicy,
+) -> bool:
+    """Proactively re-zero the scale: two Reset presses from an idle unit.
+
+    Unlike `_recover`, this does not target a state the unit is currently
+    stuck in -- it targets weight drift read from the weekly summary, before
+    that drift has necessarily produced a latch or a stall. It mirrors the
+    two-press recalibration Whisker documents for the physical button, but
+    that specific sequence -- via the API, from an idle unit -- has never
+    been independently measured the way the recovery presses in `_recover`
+    were (see the module docstring). Gated by `rezero_armed` in addition to
+    `armed` for exactly that reason.
+    """
+    _LOGGER.info(
+        "Dispatching proactive scale re-zero: week=%s max_weight=%s",
+        sample.week_start,
+        sample.max_weight,
+    )
+    if not (policy.armed and policy.rezero_armed):
+        _record_drift(store, robot, "skipped_unarmed", sample, assessment, policy)
+        return False
+
+    dispatched: list[str] = []
+    try:
+        await robot.reset()
+        dispatched.append(RESET)
+        await asyncio.sleep(policy.settle)
+        await robot.reset()
+        dispatched.append(RESET)
+        succeeded = True
+    except Exception as exc:  # noqa: BLE001 - a failed re-zero is data, not a crash
+        _LOGGER.error("Scale re-zero failed: %s", type(exc).__name__)
+        succeeded = False
+
+    _record_drift(
+        store,
+        robot,
+        "rezero",
+        sample,
+        assessment,
+        policy,
+        extra={"commands": dispatched, "succeeded": succeeded},
+    )
+    _LOGGER.info("Scale re-zero %s.", "dispatched" if succeeded else "failed to dispatch")
     return succeeded
 
 
@@ -1181,6 +1452,50 @@ def _record(
         source="intervention",
         robot_id=pseudonym(robot.serial),
         payload=payload,
+    )
+
+
+def _record_drift(
+    store: InterventionStore,
+    robot: LitterRobot4,
+    kind: str,
+    sample: WeightSample,
+    assessment: Assessment,
+    policy: RecoveryPolicy,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Persist a proactive re-zero decision, parallel to `_record` for stuck states."""
+    observed_at = datetime.now(UTC).isoformat()
+    payload: dict[str, Any] = {
+        "at": observed_at,
+        "kind": kind,
+        "armed": policy.armed and policy.rezero_armed,
+        "weight_sample": {
+            "week_start": sample.week_start,
+            "max_weight": sample.max_weight,
+        },
+        "assessment": assessment.to_payload(),
+    }
+    if extra:
+        payload["steps"] = extra
+    store.add(
+        observed_at=observed_at,
+        source="intervention",
+        robot_id=pseudonym(robot.serial),
+        payload=payload,
+    )
+
+
+def _latest_weight_sample(rows: Sequence[dict[str, Any]], at: float) -> WeightSample | None:
+    """Reduce a `fetch_summary` result to the most recent week's weight reading."""
+    dated = [row for row in rows if isinstance(row.get("weekEnd"), str)]
+    if not dated:
+        return None
+    latest = max(dated, key=lambda row: str(row["weekEnd"]))
+    return WeightSample(
+        at=at,
+        week_start=_text(latest.get("weekStart")),
+        max_weight=number(latest.get("maxWeight")),
     )
 
 
