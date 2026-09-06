@@ -30,7 +30,7 @@ jobs:
     # `private` clause is false and this always resolves to a GitHub-hosted
     # runner — which is both the free tier and the only safe answer, since a
     # fork PR on a public repo must never reach a self-hosted runner.
-    runs-on: ${{ vars.USE_SELF_HOSTED_RUNNER == 'true' && github.event.repository.private && 'self-hosted' || 'ubuntu-latest' }}
+    runs-on: ${{ fromJSON(vars.USE_SELF_HOSTED_RUNNER == 'true' && github.event.repository.private && '["self-hosted","Linux"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
