@@ -13,4 +13,4 @@ jobs:
     # this repo, not just the ones it needs. The reusable workflow declares no
     # `secrets:` in its `workflow_call` and uses only `secrets.GITHUB_TOKEN`,
     # which GitHub provides to called workflows automatically.
-    uses: kornsour/gh-automation/.github/workflows/dependabot-auto-merge.yml@main
+    uses: kornsour/gh-automation/.github/workflows/dependabot-auto-merge.yml@656f46da71566a02a641be3dcc26e07339b6e689 # dependabot-auto-merge.yml pinned 2026-09-06
