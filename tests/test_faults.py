@@ -208,6 +208,7 @@ def test_save_state_persists_the_fault_latch_across_invocations() -> None:
         Watchdog(RecoveryPolicy()),
         DrawerMonitor(DrawerPolicy()),
         monitor,
+        None,
     )
 
     stored = table.items[("lr4-test", "STATE")]
