@@ -13,6 +13,12 @@ whisker_secret_arn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:lr4-w
 # Keep false until detection-only CloudWatch/DynamoDB evidence has been reviewed.
 armed = false
 
+# The proactive scale re-zero, gated separately from `armed` because its idle
+# double-press is inferred from Whisker's button documentation rather than
+# measured. Read WATCHDOG_SCALE_DRIFT lines from a detection-only run before
+# setting this true.
+rezero_armed = false
+
 # Notified when the unit is stuck, when the watchdog stands down, when the waste
 # drawer needs emptying, and when the scheduled check is failing. Worth setting
 # before arming, not after: the stuck alarm is what tells you the box needs you

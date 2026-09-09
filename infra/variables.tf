@@ -20,6 +20,19 @@ variable "armed" {
   description = "Explicitly permit device-control commands. Detection-only is the safe default."
 }
 
+variable "rezero_armed" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Additionally permit the proactive scale re-zero. Deliberately separate from
+    `armed`, and not implied by it: every other command this watchdog sends was
+    measured against this unit, while the re-zero's idle double-press is
+    inferred from Whisker's physical-button documentation and has never been
+    confirmed through the API. A Reset can rotate the globe, so the unverified
+    path gets its own switch. Has no effect unless `armed` is also true.
+  EOT
+}
+
 variable "alarm_email" {
   type        = string
   default     = ""

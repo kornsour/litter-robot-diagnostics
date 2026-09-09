@@ -1301,6 +1301,32 @@ def log_stuck(assessment: Assessment, policy: RecoveryPolicy) -> None:
     )
 
 
+def log_scale_drift(assessment: Assessment, sample: WeightSample, policy: RecoveryPolicy) -> None:
+    """Emit the alarm line for weight drift, whatever the watchdog does next.
+
+    Deliberately *not* routed through `log_stuck`, for two reasons. A drifting
+    scale on an idle unit is not a stuck box -- nothing is blocking the cats
+    yet -- and folding it into `WATCHDOG_STUCK` would overstate the urgency of
+    a condition whose whole point is that it is caught early. It would also
+    flap that alarm: the drift check runs on `rezero_poll_interval` rather than
+    every poll, so the marker cannot hold a five-minute alarm in ALARM the way
+    a once-a-minute one does.
+
+    Like `log_stuck`, this fires on *detection* rather than on dispatch, so an
+    unarmed deployment -- which is the default for the re-zero specifically --
+    still reports the drift it declined to act on.
+    """
+    _LOGGER.info(
+        "WATCHDOG_SCALE_DRIFT week=%s max_weight=%s ceiling=%.1f armed=%s acting=%s blocked=%s",
+        sample.week_start,
+        "-" if sample.max_weight is None else f"{sample.max_weight:.2f}",
+        policy.rezero_weight_ceiling,
+        policy.armed and policy.rezero_armed,
+        assessment.should_act,
+        assessment.blocked_by or "-",
+    )
+
+
 def next_recovery_command(
     reason: str | None, observation: Observation, *, sent: Sequence[str]
 ) -> str | None:

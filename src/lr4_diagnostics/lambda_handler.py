@@ -16,6 +16,7 @@ import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from hashlib import sha256
 from time import time
 from typing import Any
@@ -32,16 +33,26 @@ from pylitterbot.exceptions import LitterRobotException
 from .analysis import parse_timestamp
 from .autoreset import (
     CAT_ACTIVITY_VALUES,
+    InterventionStore,
     Observation,
     RecoveryPolicy,
     Watchdog,
+    _latest_weight_sample,
     _record,
+    _record_drift,
     _recover,
+    _rezero_scale,
+    log_scale_drift,
     log_stuck,
 )
 from .drawer import DrawerMonitor, DrawerPolicy, DrawerReading, log_drawer_full
 from .faults import FaultMonitor, FaultPolicy, FaultReading, log_motor_fault
-from .queries import GraphQLQueryError, fetch_activity, fetch_history_download
+from .queries import (
+    GraphQLQueryError,
+    fetch_activity,
+    fetch_history_download,
+    fetch_summary,
+)
 from .redact import pseudonym, redact_payload
 
 _LOGGER = logging.getLogger(__name__)
@@ -105,6 +116,14 @@ async def _run_once() -> dict[str, int]:
     table_name = _required_env("WATCHDOG_STATE_TABLE")
     secret_arn = _required_env("WHISKER_SECRET_ARN")
     armed = os.getenv("WATCHDOG_ARMED", "false").lower() == "true"
+    # A second, independent gate, and deliberately not derived from
+    # `WATCHDOG_ARMED`. The stuck-state recovery presses were measured against
+    # this unit; the proactive re-zero's idle double-press is inferred from
+    # Whisker's physical-button documentation and has never been confirmed
+    # through the API. `WATCHDOG_ARMED` is already true in the deployment, so
+    # sharing its flag would have armed an unverified command path the moment
+    # this shipped.
+    rezero_armed = os.getenv("WATCHDOG_REZERO_ARMED", "false").lower() == "true"
     dynamodb: Any = boto3.resource("dynamodb", config=_AWS_TIMEOUT)
     table = dynamodb.Table(table_name)
     secrets = boto3.client("secretsmanager", config=_AWS_TIMEOUT)
@@ -116,7 +135,7 @@ async def _run_once() -> dict[str, int]:
         credentials["token"] = token
         token_changed = True
 
-    policy = RecoveryPolicy(armed=armed)
+    policy = RecoveryPolicy(armed=armed, rezero_armed=rezero_armed)
     policy.validate()
     drawer_policy = _drawer_policy()
     drawer_policy.validate()
@@ -174,6 +193,11 @@ async def _run_once() -> dict[str, int]:
                     drawer.restore(json.loads(state["drawer"]))
                 if state and isinstance(state.get("faults"), str):
                     faults.restore(json.loads(state["faults"]))
+                summary_checked_at = (
+                    float(state["last_summary_check"])
+                    if state and isinstance(state.get("last_summary_check"), Decimal)
+                    else None
+                )
 
                 # Without a trustworthy activity response we cannot prove the quiet
                 # period; fail closed rather than risk a reset around a cat.
@@ -248,7 +272,7 @@ async def _run_once() -> dict[str, int]:
                         # device and the only record of it would be lost, leaving
                         # the next invocation with no cooldown and no attempt count.
                         watchdog.note_attempt(dispatched=policy.armed, at=time())
-                        _save_state(table, robot_id, watchdog, drawer, faults)
+                        _save_state(table, robot_id, watchdog, drawer, faults, summary_checked_at)
                         returned_home = await _recover(
                             robot, observation, assessment, store, policy
                         )
@@ -268,7 +292,35 @@ async def _run_once() -> dict[str, int]:
                                 "a human intervenes at the unit.",
                                 watchdog.consecutive_failures,
                             )
-                _save_state(table, robot_id, watchdog, drawer, faults)
+                # Skipped in an invocation that already drove the globe. Every
+                # drift gate would refuse anyway -- `_blocked_by_drift` wants an
+                # idle, healthy unit -- and the hourly cadence means nothing is
+                # lost by waiting for the next one.
+                if not (assessment.stuck and assessment.should_act) and _summary_due(
+                    summary_checked_at, now, policy
+                ):
+                    summary_checked_at = now
+                    rezero_attempts, rezero_recoveries = await _maybe_rezero(
+                        account,
+                        robot,
+                        watchdog,
+                        store,
+                        policy,
+                        routine,
+                        now,
+                        partial(
+                            _save_state,
+                            table,
+                            robot_id,
+                            watchdog,
+                            drawer,
+                            faults,
+                            summary_checked_at,
+                        ),
+                    )
+                    attempts += rezero_attempts
+                    recoveries += rezero_recoveries
+                _save_state(table, robot_id, watchdog, drawer, faults, summary_checked_at)
     except TimeoutError:
         # Either ceiling lands here: aiohttp raises a `TimeoutError` subclass
         # for a single stalled request, and the budget raises one for the pass
@@ -394,21 +446,105 @@ def _save_state(
     watchdog: Watchdog,
     drawer: DrawerMonitor,
     faults: FaultMonitor,
+    last_summary_check: float | None,
 ) -> None:
     """Persist the safety timers and monitor state that gate the next invocation."""
-    table.put_item(
-        Item={
-            "robot_id": robot_id,
-            "recorded_at": "STATE",
-            "watchdog": json.dumps(watchdog.snapshot(), separators=(",", ":")),
-            # Shares the item so one write covers all three: these streaks and
-            # latches are as meaningless per-invocation as the watchdog timers
-            # are, and separate items could diverge from them.
-            "drawer": json.dumps(drawer.snapshot(), separators=(",", ":")),
-            "faults": json.dumps(faults.snapshot(), separators=(",", ":")),
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-    )
+    item: dict[str, Any] = {
+        "robot_id": robot_id,
+        "recorded_at": "STATE",
+        "watchdog": json.dumps(watchdog.snapshot(), separators=(",", ":")),
+        # Shares the item so one write covers all three: these streaks and
+        # latches are as meaningless per-invocation as the watchdog timers
+        # are, and separate items could diverge from them.
+        "drawer": json.dumps(drawer.snapshot(), separators=(",", ":")),
+        "faults": json.dumps(faults.snapshot(), separators=(",", ":")),
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    if last_summary_check is not None:
+        # `put_item` replaces the whole item, so every caller has to carry this
+        # through -- dropping it on one of the mid-loop saves would re-open the
+        # weekly poll on the very next invocation.
+        item["last_summary_check"] = Decimal(str(round(last_summary_check, 3)))
+    table.put_item(Item=item)
+
+
+def _summary_due(last_check: float | None, now: float, policy: RecoveryPolicy) -> bool:
+    """Whether the weekly weight summary is worth re-reading yet.
+
+    The schedule fires once a minute against an aggregate that changes at most
+    once a week. Without this gate the handler would spend 1,440 GraphQL reads
+    a day watching a number that moves 52 times a year.
+    """
+    return last_check is None or now - last_check >= policy.rezero_poll_interval
+
+
+async def _maybe_rezero(
+    account: Account,
+    robot: LitterRobot4,
+    watchdog: Watchdog,
+    store: InterventionStore,
+    policy: RecoveryPolicy,
+    routine: asyncio.Timeout,
+    now: float,
+    save_state: Callable[[], None],
+) -> tuple[int, int]:
+    """Run one proactive scale-drift check, returning (attempts, recoveries).
+
+    The scheduled counterpart of the `rezero_poll_interval` branch in
+    `autoreset._watch`. Every decision gate stays in `Watchdog.assess_drift`
+    and every command stays in `_rezero_scale`; this only supplies the weekly
+    read and the cross-invocation bookkeeping that the long-lived loop keeps
+    in memory.
+    """
+    try:
+        rows = await fetch_summary(account.session, robot.serial)
+    except GraphQLQueryError as exc:
+        # Same reasoning as the history backfill: the weekly summary is an
+        # improvement to a slow-moving mitigation, not a safety signal, so a
+        # denied or unavailable read must not interrupt monitoring.
+        _LOGGER.warning("Weight summary unavailable: %s", exc)
+        return 0, 0
+    sample = _latest_weight_sample(rows, now)
+    if sample is None:
+        return 0, 0
+
+    assessment = watchdog.assess_drift(sample)
+    if not assessment.stuck:
+        return 0, 0
+    _record_drift(store, robot, "drift_assessment", sample, assessment, policy)
+    log_scale_drift(assessment, sample, policy)
+    if not assessment.should_act:
+        return 0, 0
+
+    # `_rezero_scale` waits `settle` between the two presses, which alone is
+    # most of the routine budget. Suspending it keeps that budget a bound on
+    # stalled reads rather than a cap on a wait that is meant to be long --
+    # the same reasoning as the recovery dispatch in `_run_once`.
+    routine.reschedule(None)
+    # Persisted before dispatch, for the same reason as `note_attempt`: if the
+    # invocation dies between here and the second press, a command has still
+    # reached the device, and losing the record would leave the next
+    # invocation with no re-zero cooldown and no failure count.
+    watchdog.note_rezero_attempt(sample.week_start, at=now)
+    save_state()
+    succeeded = await _rezero_scale(robot, sample, assessment, store, policy)
+    routine.reschedule(asyncio.get_running_loop().time() + _ROUTINE_BUDGET_SECONDS)
+
+    if not (policy.armed and policy.rezero_armed):
+        # Nothing was dispatched, so there is no outcome to judge; recording a
+        # failure here would walk an unarmed deployment into escalation.
+        return 1, 0
+    if succeeded:
+        watchdog.note_rezero_succeeded()
+    else:
+        watchdog.note_rezero_failed()
+    if watchdog.rezero_escalated:
+        _LOGGER.error(
+            "WATCHDOG_REZERO_ESCALATED failures=%d; standing down on proactive "
+            "re-zero until a human intervenes at the unit.",
+            watchdog.rezero_consecutive_failures,
+        )
+    return 1, (1 if succeeded else 0)
 
 
 def _drawer_policy() -> DrawerPolicy:

@@ -63,6 +63,11 @@ jobs:
           # to discover your watchdog stopped acting. Must be exactly `true` or
           # `false`; anything else fails the apply rather than guessing.
           TF_VAR_armed: ${{ vars.WATCHDOG_ARMED || 'false' }}
+          # The proactive scale re-zero, plumbed the same way and kept a
+          # separate variable on purpose: `WATCHDOG_ARMED` is already true, so
+          # deriving this from it would arm an unverified command path on the
+          # next merge rather than when somebody decided to.
+          TF_VAR_rezero_armed: ${{ vars.WATCHDOG_REZERO_ARMED || 'false' }}
           # The state bucket name embeds the AWS account ID. It is needed twice:
           # once by `tofu init` to reach the backend, once by the deploy role's
           # own IAM policy, which grants access to that bucket by ARN.

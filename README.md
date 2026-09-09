@@ -364,6 +364,7 @@ gh workflow run deploy-watchdog.yml --repo kornsour/litter-robot-diagnostics
 | `TF_VAR_WHISKER_SECRET_ARN` | repo **secret** | apply fails |
 | `TF_VAR_ALARM_EMAIL` | repo **secret** | topic deploys with no subscriber; alarms fire into nothing |
 | `WATCHDOG_ARMED` | repo **variable** | `false` |
+| `WATCHDOG_REZERO_ARMED` | repo **variable** | `false` |
 
 `WATCHDOG_ARMED` is a variable rather than a secret on purpose: whether a
 machine that physically moves is permitted to move should be readable at a
@@ -386,10 +387,27 @@ Confirm what actually shipped, rather than trusting the variable:
 aws lambda get-function-configuration --function-name lr4-watchdog --region us-west-2 --query 'Environment.Variables.WATCHDOG_ARMED'
 ```
 
+`WATCHDOG_REZERO_ARMED` is a second, independent switch covering the proactive
+scale re-zero, and `WATCHDOG_ARMED` does **not** imply it. Every other command
+the watchdog sends was measured against this unit (see the decision table in
+`autoreset._recover`); the re-zero's idle double-press is inferred from
+Whisker's physical-button documentation and has never been confirmed through
+the API. A Reset can rotate the globe, so the unverified path gets its own
+switch and its own decision:
+
+```bash
+gh variable set WATCHDOG_REZERO_ARMED --body true --repo kornsour/litter-robot-diagnostics
+gh workflow run deploy-watchdog.yml --repo kornsour/litter-robot-diagnostics
+```
+
+Worth reading `WATCHDOG_SCALE_DRIFT` lines from a detection-only run first: the
+marker is emitted whether or not the re-zero is armed, so you can see which
+weeks it would have acted on before letting it act.
+
 #### Alerting
 
 Set `alarm_email` in `infra/terraform.tfvars` and confirm the subscription mail
-AWS sends. Five alarms publish to one SNS topic:
+AWS sends. Seven alarms publish to one SNS topic:
 
 | Alarm | Fires when | Why it matters |
 |---|---|---|
@@ -397,12 +415,14 @@ AWS sends. Five alarms publish to one SNS topic:
 | `lr4-watchdog-drawer-full` | the waste drawer needs emptying | Whisker only announces this with an app push — no email, no webhook, no public API. See below. |
 | `lr4-watchdog-motor-fault` | the unit reports a latched hardware fault | Nothing else can see it: the unit returns to an idle display while the flag stays set, so both the app and `assess` show a healthy unit. See below. |
 | `lr4-watchdog-escalated` | the watchdog stands down | Escalation is a one-way latch. It will not act again until the DynamoDB `STATE` item is deleted by hand. |
+| `lr4-watchdog-scale-drift` | weekly `maxWeight` is past the physical ceiling | The early warning the investigation turns on: it fires while the unit still looks healthy on every other signal. See [docs/hypothesis.md](docs/hypothesis.md). |
+| `lr4-watchdog-rezero-escalated` | proactive re-zero stands down | Same one-way latch as `escalated`, and it needs its own filter: CloudWatch patterns match whole tokens, so `WATCHDOG_ESCALATED` never matches `WATCHDOG_REZERO_ESCALATED`. |
 | `lr4-watchdog-errors` | ≥3 invocation errors over two 5-minute periods | The handler fails closed, so sustained errors mean the unit is unmonitored. The threshold rides over single expired-token blips. A run that blows its budget lands here too, tagged `WATCHDOG_TIMEOUT` in the log. |
 
 ##### Waste drawer
 
 `drawer.py` folds `DFILevelPercent` into a pure state machine and emits
-`WATCHDOG_DRAWER_FULL` once the level holds. Two gates keep it to one mail per
+`WATCHDOG_DRAWER_FULL` once the level holds. Three gates keep it to one mail per
 fill rather than one per check:
 
 - **Persistence** — `drawer_consecutive_samples` (default 5) at-rest readings at
@@ -413,6 +433,14 @@ fill rather than one per check:
 - **Hysteresis** — the warning is only released below `drawer_clear_percent`
   (default 60), which only an emptied drawer reaches. Releasing on the first dip
   would flap the alarm OK→ALARM and re-send the mail on every swing back up.
+- **Invocation-gap tolerance** — the alarm needs one breaching datapoint in
+  three 5-minute periods rather than one in one. The marker holding the alarm in
+  ALARM depends on invocations continuing to run, and a recovery breaks exactly
+  that: it holds the DynamoDB lease while it drives the globe and watches it
+  park, so every invocation behind it skips and emits nothing at all. Measured
+  2026-09-07, a 5m17s recovery blanked minutes 11:57–12:01, dropped this alarm
+  to OK and re-raised it the next minute — a second mail for a drawer nobody had
+  touched. Three periods rides out a lease held for the whole Lambda timeout.
 
 Together those make it **exactly one mail per fill**, however long the drawer
 stays full: alarm actions fire on state transitions only, and the marker line
@@ -429,8 +457,16 @@ Sizing the band: in the 2026-07-25/28 capture the drawer percentage was stable
 to 0.0 within every hour but one, and swung 7 points (18→25) in the hour a cycle
 ran — including in the at-rest samples either side of it. A 25-point band leaves
 comfortable margin over that. The capture never reached a full drawer, though,
-so the 85 threshold itself is unvalidated against this unit; re-check it against
-`dfi_level_pct` once a real fill has been recorded.
+so the 85 threshold itself was unvalidated against this unit when that band was
+chosen.
+
+The first real fill has now been recorded — 2026-09-05 21:15 onward — and it
+argues the band is if anything too narrow. Across it the reported percentage
+swung far wider than the capture predicted: 70→100 inside a single three-hour
+window on 09-06, against a drawer that only fills. The warning latched at 85 and
+had not released two days later, still reading 73 and so held by the 60-point
+hysteresis floor rather than by a genuinely full drawer. Worth re-checking
+`dfi_level_pct` against an emptied drawer before trusting either threshold.
 
 ##### Latched hardware faults
 
@@ -488,6 +524,7 @@ organization):
 | `TF_LOCK_TABLE` | variable | Optional. Defaults to `lr4-watchdog-tofu-lock` |
 | `AWS_REGION` | variable | Optional. Defaults to `us-west-2` |
 | `WATCHDOG_ARMED` | variable | `true` or `false`. A variable, not a secret, on purpose |
+| `WATCHDOG_REZERO_ARMED` | variable | `true` or `false`. Gates the proactive scale re-zero only; not implied by `WATCHDOG_ARMED` |
 
 Two of those are needed because a `backend "s3"` block cannot reference
 variables — an OpenTofu limitation, not a style choice — so the bucket and lock

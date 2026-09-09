@@ -199,6 +199,7 @@ resource "aws_lambda_function" "watchdog" {
       WATCHDOG_STATE_TABLE       = aws_dynamodb_table.watchdog.name
       WHISKER_SECRET_ARN         = var.whisker_secret_arn
       WATCHDOG_ARMED             = tostring(var.armed)
+      WATCHDOG_REZERO_ARMED      = tostring(var.rezero_armed)
       DRAWER_WARN_PERCENT        = tostring(var.drawer_warn_percent)
       DRAWER_CLEAR_PERCENT       = tostring(var.drawer_clear_percent)
       DRAWER_CONSECUTIVE_SAMPLES = tostring(var.drawer_consecutive_samples)
@@ -245,13 +246,24 @@ resource "aws_cloudwatch_log_metric_filter" "stuck" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "stuck" {
-  alarm_name          = "${var.name_prefix}-watchdog-stuck"
-  alarm_description   = "The LR4 is stuck; the watchdog has assessed it as needing recovery."
-  namespace           = "LR4Watchdog"
-  metric_name         = aws_cloudwatch_log_metric_filter.stuck.metric_transformation[0].name
-  statistic           = "Sum"
-  period              = 300
-  evaluation_periods  = 1
+  alarm_name        = "${var.name_prefix}-watchdog-stuck"
+  alarm_description = "The LR4 is stuck; the watchdog has assessed it as needing recovery."
+  namespace         = "LR4Watchdog"
+  metric_name       = aws_cloudwatch_log_metric_filter.stuck.metric_transformation[0].name
+  statistic         = "Sum"
+  period            = 300
+  # A marker alarm is held in ALARM by the marker repeating once a minute, so
+  # any gap in invocations reads as "condition cleared". Recovery is exactly
+  # such a gap: it holds the DynamoDB lease while it drives the globe and
+  # watches it park, so every invocation behind it skips and emits nothing.
+  # Measured 2026-09-07: a 5m17s recovery blanked minutes 11:57-12:01, which
+  # dropped this to OK and re-raised it the next minute -- a second mail for a
+  # condition that never changed. Requiring one breaching datapoint in three
+  # periods rides out a lease held for the full Lambda timeout. The cost is
+  # that a genuine clear takes 15 minutes to show, which nothing acts on:
+  # there are no `ok_actions` here.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
@@ -325,13 +337,24 @@ resource "aws_cloudwatch_log_metric_filter" "drawer_full" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "drawer_full" {
-  alarm_name          = "${var.name_prefix}-watchdog-drawer-full"
-  alarm_description   = "The LR4 waste drawer is at or above ${var.drawer_warn_percent}% and needs emptying."
-  namespace           = "LR4Watchdog"
-  metric_name         = aws_cloudwatch_log_metric_filter.drawer_full.metric_transformation[0].name
-  statistic           = "Sum"
-  period              = 300
-  evaluation_periods  = 1
+  alarm_name        = "${var.name_prefix}-watchdog-drawer-full"
+  alarm_description = "The LR4 waste drawer is at or above ${var.drawer_warn_percent}% and needs emptying."
+  namespace         = "LR4Watchdog"
+  metric_name       = aws_cloudwatch_log_metric_filter.drawer_full.metric_transformation[0].name
+  statistic         = "Sum"
+  period            = 300
+  # A marker alarm is held in ALARM by the marker repeating once a minute, so
+  # any gap in invocations reads as "condition cleared". Recovery is exactly
+  # such a gap: it holds the DynamoDB lease while it drives the globe and
+  # watches it park, so every invocation behind it skips and emits nothing.
+  # Measured 2026-09-07: a 5m17s recovery blanked minutes 11:57-12:01, which
+  # dropped this to OK and re-raised it the next minute -- a second mail for a
+  # condition that never changed. Requiring one breaching datapoint in three
+  # periods rides out a lease held for the full Lambda timeout. The cost is
+  # that a genuine clear takes 15 minutes to show, which nothing acts on:
+  # there are no `ok_actions` here.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
@@ -363,13 +386,24 @@ resource "aws_cloudwatch_log_metric_filter" "motor_fault" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "motor_fault" {
-  alarm_name          = "${var.name_prefix}-watchdog-motor-fault"
-  alarm_description   = "The LR4 is reporting a latched hardware fault flag."
-  namespace           = "LR4Watchdog"
-  metric_name         = aws_cloudwatch_log_metric_filter.motor_fault.metric_transformation[0].name
-  statistic           = "Sum"
-  period              = 300
-  evaluation_periods  = 1
+  alarm_name        = "${var.name_prefix}-watchdog-motor-fault"
+  alarm_description = "The LR4 is reporting a latched hardware fault flag."
+  namespace         = "LR4Watchdog"
+  metric_name       = aws_cloudwatch_log_metric_filter.motor_fault.metric_transformation[0].name
+  statistic         = "Sum"
+  period            = 300
+  # A marker alarm is held in ALARM by the marker repeating once a minute, so
+  # any gap in invocations reads as "condition cleared". Recovery is exactly
+  # such a gap: it holds the DynamoDB lease while it drives the globe and
+  # watches it park, so every invocation behind it skips and emits nothing.
+  # Measured 2026-09-07: a 5m17s recovery blanked minutes 11:57-12:01, which
+  # dropped this to OK and re-raised it the next minute -- a second mail for a
+  # condition that never changed. Requiring one breaching datapoint in three
+  # periods rides out a lease held for the full Lambda timeout. The cost is
+  # that a genuine clear takes 15 minutes to show, which nothing acts on:
+  # there are no `ok_actions` here.
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
   threshold           = 1
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
@@ -402,4 +436,76 @@ resource "aws_lambda_permission" "eventbridge" {
   function_name = aws_lambda_function.watchdog.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.watchdog.arn
+}
+
+# `WATCHDOG_ESCALATED` cannot cover this one. CloudWatch text patterns match
+# whole tokens, so that filter never sees `WATCHDOG_REZERO_ESCALATED` -- the
+# re-zero could stand down permanently without anything saying so. Escalation
+# is a one-way latch cleared only by hand at the unit, so a silent one is a
+# mitigation that has quietly stopped mitigating.
+resource "aws_cloudwatch_log_metric_filter" "rezero_escalated" {
+  depends_on     = [aws_iam_role_policy.github_deploy]
+  name           = "${var.name_prefix}-watchdog-rezero-escalated"
+  log_group_name = aws_cloudwatch_log_group.watchdog.name
+  pattern        = "WATCHDOG_REZERO_ESCALATED"
+
+  metric_transformation {
+    name          = "WatchdogRezeroEscalations"
+    namespace     = "LR4Watchdog"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "rezero_escalated" {
+  alarm_name          = "${var.name_prefix}-watchdog-rezero-escalated"
+  alarm_description   = "Proactive scale re-zero failed repeatedly; the watchdog has stood down and needs a human."
+  namespace           = "LR4Watchdog"
+  metric_name         = aws_cloudwatch_log_metric_filter.rezero_escalated.metric_transformation[0].name
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+}
+
+# The scale-drift signal the whole investigation turns on (docs/hypothesis.md):
+# a weekly maxWeight past what the household's cats can physically produce.
+# Worth its own alarm rather than folding into the stuck alarm, because it
+# fires while the unit still looks healthy -- that early warning is the point.
+#
+# The period is an hour, not five minutes, because the handler reads the weekly
+# summary on `rezero_poll_interval` rather than every invocation; a 300s window
+# would be empty for 11 of every 12 periods and flap once an hour. Two periods
+# then means a drift episode is one mail, and clears two hours after the weekly
+# number comes back under the ceiling.
+resource "aws_cloudwatch_log_metric_filter" "scale_drift" {
+  depends_on     = [aws_iam_role_policy.github_deploy]
+  name           = "${var.name_prefix}-watchdog-scale-drift"
+  log_group_name = aws_cloudwatch_log_group.watchdog.name
+  pattern        = "WATCHDOG_SCALE_DRIFT"
+
+  metric_transformation {
+    name          = "WatchdogScaleDrift"
+    namespace     = "LR4Watchdog"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "scale_drift" {
+  alarm_name          = "${var.name_prefix}-watchdog-scale-drift"
+  alarm_description   = "Weekly maxWeight is past the physical ceiling; the base scale is drifting again."
+  namespace           = "LR4Watchdog"
+  metric_name         = aws_cloudwatch_log_metric_filter.scale_drift.metric_transformation[0].name
+  statistic           = "Sum"
+  period              = 3600
+  evaluation_periods  = 2
+  datapoints_to_alarm = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
 }

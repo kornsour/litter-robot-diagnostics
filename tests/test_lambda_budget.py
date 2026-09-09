@@ -116,11 +116,17 @@ class FakeRobot:
     serial = "LR4C-TEST-0001"
 
     def __init__(self, state: dict[str, Any]) -> None:
-        self._state = state
+        # Copied, not aliased: a test that swaps the unit into another state
+        # mid-run would otherwise rewrite the shared constant it was built from.
+        self._state = dict(state)
         self.refreshes = 0
+        self.resets = 0
 
     async def refresh(self) -> None:
         self.refreshes += 1
+
+    async def reset(self) -> None:
+        self.resets += 1
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self._state)
@@ -155,7 +161,9 @@ def _harness(
     *,
     state: dict[str, Any],
     armed: bool = False,
+    rezero_armed: bool = False,
     activity: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None,
+    summary: Callable[[], Awaitable[list[dict[str, Any]]]] | None = None,
 ) -> tuple[FakeTable, FakeRobot, FakeSecrets]:
     """Wire `_run_once` to fakes, leaving every decision gate real."""
     table = FakeTable()
@@ -178,17 +186,22 @@ def _harness(
     async def fetch_history(_session: Any, _serial: str, **_: Any) -> list[dict[str, Any]]:
         return []
 
+    async def fetch_summary(_session: Any, _serial: str, **_: Any) -> list[dict[str, Any]]:
+        return [] if summary is None else await summary()
+
     async def connect(*_args: Any, **_kwargs: Any) -> FakeAccount:
         return account
 
     monkeypatch.setenv("WATCHDOG_STATE_TABLE", "watchdog")
     monkeypatch.setenv("WHISKER_SECRET_ARN", "arn:aws:secretsmanager:test")
     monkeypatch.setenv("WATCHDOG_ARMED", "true" if armed else "false")
+    monkeypatch.setenv("WATCHDOG_REZERO_ARMED", "true" if rezero_armed else "false")
     monkeypatch.setattr(lambda_handler.boto3, "resource", resource)
     monkeypatch.setattr(lambda_handler.boto3, "client", client)
     monkeypatch.setattr(lambda_handler, "LitterRobot4", FakeRobot)
     monkeypatch.setattr(lambda_handler, "fetch_activity", fetch_activity)
     monkeypatch.setattr(lambda_handler, "fetch_history_download", fetch_history)
+    monkeypatch.setattr(lambda_handler, "fetch_summary", fetch_summary)
     monkeypatch.setattr(lambda_handler, "_connect", connect)
     monkeypatch.setattr(lambda_handler, "ClientSession", FakeClientSession)
     FakeClientSession.instances = []
