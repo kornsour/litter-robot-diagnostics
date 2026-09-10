@@ -31,6 +31,22 @@ terraform {
 
 provider "aws" {
   region = var.aws_region
+
+  # These five are already on every resource in the live stack, applied out of
+  # band and never declared here. Without this block a plan reads them as drift
+  # and strips them -- which is what the first real `tofu plan` against this
+  # configuration turned out to be proposing, on eleven resources at once.
+  # Declaring them makes the configuration match what is deployed, so an apply
+  # changes only what it means to change.
+  default_tags {
+    tags = {
+      Application = "litter-robot-diagnostics"
+      Environment = "personal"
+      Lifecycle   = "active"
+      ManagedBy   = "opentofu"
+      Owner       = "akaiserauer"
+    }
+  }
 }
 
 data "aws_caller_identity" "current" {}
@@ -39,6 +55,29 @@ resource "aws_iam_openid_connect_provider" "github" {
   url             = "https://token.actions.githubusercontent.com"
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+}
+
+# GitHub issues the `sub` claim in two shapes, and this role has to accept both.
+#
+# The original is `repo:OWNER/REPO:ref:refs/heads/BRANCH`. GitHub now also
+# issues an immutable-id form that appends the numeric owner and repository ids
+# to each name -- `repo:kornsour@12611126/litter-robot-diagnostics@1346772541:...`
+# -- so that a rename cannot silently transfer trust to whoever claims the freed
+# name. Pinning only the first shape is why every CI deploy since 2026-08-28
+# failed `AssumeRoleWithWebIdentity`: the role and the provider were both
+# correct, and the claim simply no longer matched the string.
+#
+# Only the ids are wildcarded. The owner, the repository and the branch all stay
+# exact, so this still trusts one branch of one repository -- `@*` can only
+# stand in for the digits that identify the very same owner and repo.
+locals {
+  github_owner      = split("/", var.github_repository)[0]
+  github_repo_name  = split("/", var.github_repository)[1]
+  github_deploy_ref = "ref:refs/heads/${var.github_default_branch}"
+  github_deploy_subs = [
+    "repo:${var.github_repository}:${local.github_deploy_ref}",
+    "repo:${local.github_owner}@*/${local.github_repo_name}@*:${local.github_deploy_ref}",
+  ]
 }
 
 resource "aws_iam_role" "github_deploy" {
@@ -54,7 +93,11 @@ resource "aws_iam_role" "github_deploy" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_repository}:ref:refs/heads/${var.github_default_branch}"
+        }
+        # A list is OR-ed, so either shape is accepted. `StringLike` is required
+        # for the wildcard; the audience above stays an exact `StringEquals`.
+        StringLike = {
+          "token.actions.githubusercontent.com:sub" = local.github_deploy_subs
         }
       }
     }]
@@ -135,10 +178,6 @@ resource "aws_dynamodb_table" "watchdog" {
     enabled        = true
   }
 
-  tags = {
-    Application = "litter-robot-diagnostics"
-    ManagedBy   = "opentofu"
-  }
 }
 
 resource "aws_cloudwatch_log_group" "watchdog" {
