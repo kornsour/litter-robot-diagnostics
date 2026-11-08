@@ -41,6 +41,8 @@ locals {
   function_arn  = "arn:aws:lambda:${var.aws_region}:${local.account_id}:function:${var.name_prefix}-watchdog"
   topic_arn     = "arn:aws:sns:${var.aws_region}:${local.account_id}:${var.name_prefix}-watchdog-alerts"
   alarm_arn     = "arn:aws:cloudwatch:${var.aws_region}:${local.account_id}:alarm:${var.name_prefix}-watchdog-*"
+  rule_arn      = "arn:aws:events:${var.aws_region}:${local.account_id}:rule/${var.name_prefix}-*"
+  schedule_arn  = "arn:aws:scheduler:${var.aws_region}:${local.account_id}:schedule/*/${var.name_prefix}-*"
 }
 
 data "aws_identitystore_user" "owner" {
@@ -102,15 +104,20 @@ resource "aws_ssoadmin_permission_set_inline_policy" "diagnostics_readonly" {
         Resource = "*"
       },
       # Alarm state and history: did the stuck/escalated alarm ever fire, and
-      # when did it transition.
+      # when did it transition. The describe calls are list operations, so IAM
+      # evaluates them against `alarm:*` and an `lr4-watchdog-*` scoped
+      # Resource never matches ("no identity-based policy allows"). They need
+      # `*`; DescribeAlarmsForMetric has no resource-level support at all. This
+      # exposes alarm names/state for other alarms in the account, no more.
       {
-        Sid    = "ReadWatchdogAlarms"
+        Sid    = "ReadAlarms"
         Effect = "Allow"
         Action = [
           "cloudwatch:DescribeAlarms",
           "cloudwatch:DescribeAlarmHistory",
+          "cloudwatch:DescribeAlarmsForMetric",
         ]
-        Resource = local.alarm_arn
+        Resource = "*"
       },
       # Metric reads carry no resource ARN in IAM *and* do not honour the
       # `cloudwatch:namespace` condition key -- a first attempt scoped these to
@@ -156,6 +163,39 @@ resource "aws_ssoadmin_permission_set_inline_policy" "diagnostics_readonly" {
         Action   = ["lambda:GetFunctionConfiguration"]
         Resource = local.function_arn
       },
+      # The watchdog's triggers: the EventBridge rule or Scheduler schedule
+      # that fires the Lambda. Describe/GetSchedule are scoped to the lr4-*
+      # names; ListRules/ListSchedules are list operations that cannot be
+      # resource-scoped. Read verbs only -- see the Deny below.
+      {
+        Sid    = "ReadTriggers"
+        Effect = "Allow"
+        Action = [
+          "events:DescribeRule",
+          "events:ListTargetsByRule",
+        ]
+        Resource = local.rule_arn
+      },
+      {
+        Sid      = "ListTriggers"
+        Effect   = "Allow"
+        Action   = ["events:ListRules", "scheduler:ListSchedules"]
+        Resource = "*"
+      },
+      {
+        Sid      = "ReadSchedules"
+        Effect   = "Allow"
+        Action   = ["scheduler:GetSchedule"]
+        Resource = local.schedule_arn
+      },
+      # Metric filters that feed the alarms. Describe call, no useful
+      # resource scoping; returns filter patterns and metric names only.
+      {
+        Sid      = "ReadMetricFilters"
+        Effect   = "Allow"
+        Action   = ["logs:DescribeMetricFilters"]
+        Resource = "*"
+      },
       # Confirm the alert email is actually subscribed and confirmed. An
       # unconfirmed subscription means every alarm fires into nothing.
       {
@@ -181,15 +221,42 @@ resource "aws_ssoadmin_permission_set_inline_policy" "diagnostics_readonly" {
       # adds APIs.
       #
       # None of these prefixes collide with the allows above: DynamoDB reads
-      # are Describe/Get/BatchGet/Query/Scan, Lambda is Get only, and nothing
-      # here grants EventBridge at all.
+      # are Describe/Get/BatchGet/Query/Scan, Lambda is Get only, and EventBridge/
+      # Scheduler reads are Describe/List/Get.
       {
         Sid    = "NeverReachCredentialsOrDeviceControl"
         Effect = "Deny"
         Action = [
           "secretsmanager:*",
           # The schedule itself: no rule, target, or enablement change.
-          "events:*",
+          # This was a blanket `events:*`, which also blocked the read-only
+          # DescribeRule/ListRules/ListTargetsByRule needed to review the
+          # trigger. Now every mutating EventBridge verb family is denied by
+          # prefix and the reads are allowed above. Prefixes, not names, so
+          # new write APIs stay denied; the only non-read EventBridge verbs
+          # not covered by a prefix would be new, differently-named ones.
+          "events:Put*",
+          "events:Delete*",
+          "events:Remove*",
+          "events:Enable*",
+          "events:Disable*",
+          "events:Create*",
+          "events:Update*",
+          "events:Activate*",
+          "events:Deactivate*",
+          "events:Tag*",
+          "events:Untag*",
+          "events:Start*",
+          "events:Cancel*",
+          "events:Archive*",
+          "events:Deauthorize*",
+          "events:Test*",
+          # Scheduler equivalents (never granted; denied for the same reason).
+          "scheduler:Create*",
+          "scheduler:Delete*",
+          "scheduler:Update*",
+          "scheduler:Tag*",
+          "scheduler:Untag*",
           # Arming lives in the function's environment; code and invocation
           # are equally direct routes to moving the globe.
           "lambda:Add*",

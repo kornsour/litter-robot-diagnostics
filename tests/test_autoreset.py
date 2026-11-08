@@ -648,3 +648,183 @@ def test_interventions_are_recorded_without_the_serial_and_without_deduping(
     assert payload["observation"]["display_code"] == "DC_CAT_DETECT_30M"
     assert records[0]["robot_id"].startswith("lr4-")
     assert "SECRET" not in str(records)
+
+
+# --- Hardware faults, settle effects, and latch clears ------------------------
+
+from lr4_diagnostics.autoreset import RESET, command_landed  # noqa: E402
+
+MOTOR_TIMEOUT = {"globeMotorFaultStatus": "FAULT_TIMEOUT"}
+FAULT_FREE = {
+    "globeMotorFaultStatus": "FAULT_CLEAR",
+    "retractMotorFaultStatus": "FAULT_CLEAR",
+    "pinchStatus": "CLEAR",
+    "USBFaultStatus": "CLEAR",
+}
+#: The same stalled cycle a moment later, having churned on its own without
+#: any press: `robotCycleState` moved, but nothing paused.
+DUMPING_CHURNED: dict[str, Any] = DUMPING | {"robotCycleState": "CYCLE_STATE_PROCESS"}
+
+
+def latched_for(watchdog: Watchdog, payload: dict[str, Any], seconds: float) -> Assessment:
+    watchdog.assess(observe(0.0, payload))
+    return watchdog.assess(observe(seconds, payload))
+
+
+def test_clear_and_omitted_fault_fields_are_not_faults() -> None:
+    """An omitted field is unknown; blocking on it would stand the watchdog down."""
+    assert observe(0.0, HEALTHY).faults == ()
+    assert observe(0.0, HEALTHY | FAULT_FREE).faults == ()
+    assert observe(0.0, HEALTHY | MOTOR_TIMEOUT).fault_summary == (
+        "globeMotorFaultStatus=FAULT_TIMEOUT"
+    )
+
+
+def test_a_latched_motor_fault_blocks_recovery() -> None:
+    """2026-10-17: a second recovery ran a full cycle on a timed-out globe motor."""
+    assessment = latched_for(Watchdog(POLICY), LATCHED | MOTOR_TIMEOUT, 1_000.0)
+    assert assessment.stuck
+    assert not assessment.should_act
+    assert assessment.blocked_by is not None and "hardware fault" in assessment.blocked_by
+
+
+def test_the_same_latch_without_a_fault_still_acts() -> None:
+    assert latched_for(Watchdog(POLICY), LATCHED | FAULT_FREE, 1_000.0).should_act
+
+
+def test_a_fault_after_a_recovery_counts_as_a_failure() -> None:
+    """Both motor faults on record followed recoveries that were booked as successes."""
+    watchdog = Watchdog(POLICY)
+    watchdog.note_attempt(dispatched=True, at=0.0)
+    watchdog.assess(observe(60.0, HEALTHY | MOTOR_TIMEOUT))
+    assert watchdog.consecutive_failures == 1
+
+
+def test_a_clean_hold_after_a_recovery_is_still_a_success() -> None:
+    watchdog = Watchdog(POLICY)
+    watchdog.note_attempt(dispatched=True, at=0.0)
+    watchdog.assess(observe(POLICY.recovery_hold + 1.0, HEALTHY | FAULT_FREE))
+    assert watchdog.consecutive_failures == 0
+
+
+def test_a_reset_on_a_churning_cycle_has_not_landed_until_it_pauses() -> None:
+    """2026-08-27/09-06: any state change was read as the Reset landing."""
+    before = observe(0.0, DUMPING)
+    assert not command_landed(RESET, before, observe(5.0, DUMPING_CHURNED))
+    assert command_landed(RESET, before, observe(5.0, PAUSED_MID_DUMP))
+    assert command_landed(RESET, before, observe(5.0, HEALTHY))
+
+
+def test_a_reset_on_a_pause_has_landed_once_it_resumes() -> None:
+    before = observe(0.0, PAUSED_MID_DUMP)
+    assert not command_landed(RESET, before, observe(5.0, PAUSED_MID_DUMP))
+    assert command_landed(RESET, before, observe(5.0, DUMPING))
+
+
+class SequencedRobot:
+    """Serves a fixed sequence of states, one per refresh, holding the last."""
+
+    serial = "LR4C-SECRET-SERIAL"
+
+    def __init__(self, states: list[dict[str, Any]]) -> None:
+        self.states = states
+        self.index = -1
+        self.commands: list[str] = []
+
+    async def reset(self) -> bool:
+        self.commands.append("reset")
+        return True
+
+    async def start_cleaning(self) -> bool:
+        self.commands.append("clean_cycle")
+        return True
+
+    async def refresh(self) -> None:
+        self.index = min(self.index + 1, len(self.states) - 1)
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.states[max(self.index, 0)]
+
+
+def run_sequenced(
+    reason: str, start: dict[str, Any], states: list[dict[str, Any]]
+) -> tuple[list[str], dict[str, Any]]:
+    # A short verify window polled with no sleep, so every queued state is read.
+    policy = RecoveryPolicy(armed=True, settle=0.0, verify_timeout=0.05, poll_interval=0.0)
+    robot = SequencedRobot(states)
+    store = FakeStore()
+    assessment = Assessment(stuck=True, reason=reason, stuck_for=1_000.0, should_act=True)
+    asyncio.run(
+        _recover(
+            robot,  # type: ignore[arg-type] - only the command surface is used
+            observe(0.0, start),
+            assessment,
+            store,
+            policy,
+        )
+    )
+    return robot.commands, store.records[-1]["payload"]["steps"]
+
+
+def test_a_pause_that_registers_late_is_resumed_not_stranded() -> None:
+    """The first read after Reset shows only churn; the pause shows up afterwards."""
+    commands, steps = run_sequenced(
+        CYCLE_OVERRUN,
+        DUMPING,
+        [DUMPING_CHURNED, PAUSED_MID_DUMP, DUMPING, HEALTHY],
+    )
+    assert commands == ["reset", "reset"]
+    assert steps["commands"] == ["reset", "reset"]
+    assert steps["succeeded"] is True
+
+
+def test_the_late_resume_obeys_the_two_reset_cap() -> None:
+    _, steps = run_sequenced(CYCLE_STALL, DUMPING, [PAUSED_MID_DUMP])
+    assert steps["commands"].count("reset") == 2
+
+
+def test_parking_with_a_motor_fault_is_not_a_success() -> None:
+    """2026-08-14: home in three minutes, FAULT_TIMEOUT eleven seconds later."""
+    commands, steps = run_sequenced(
+        IDLE_LATCH,
+        LATCHED,
+        [HEALTHY, DUMPING, HEALTHY | MOTOR_TIMEOUT, HEALTHY | MOTOR_TIMEOUT],
+    )
+    assert commands == ["reset", "clean_cycle"]
+    assert steps["succeeded"] is False
+    assert steps["fault_after"] == "globeMotorFaultStatus=FAULT_TIMEOUT"
+
+
+def test_a_latch_that_clears_on_its_own_reports_how_long_it_held() -> None:
+    watchdog = Watchdog(POLICY)
+    watchdog.assess(observe(0.0, LATCHED))
+    assert watchdog.assess(observe(400.0, LATCHED)).latch_cleared_after is None
+    cleared = watchdog.assess(observe(480.0, HEALTHY))
+    assert cleared.latch_cleared_after == 480.0
+    assert watchdog.assess(observe(540.0, HEALTHY)).latch_cleared_after is None
+
+
+def test_a_latch_ended_by_a_recovery_is_not_a_self_clear() -> None:
+    watchdog = Watchdog(POLICY)
+    watchdog.assess(observe(0.0, LATCHED))
+    watchdog.note_attempt(dispatched=True, at=1_000.0)
+    assert watchdog.assess(observe(1_200.0, HEALTHY)).latch_cleared_after is None
+
+
+def test_a_latch_clear_survives_a_scheduled_restore() -> None:
+    """The Lambda rebuilds the watchdog every minute; the timer must carry over."""
+    first = Watchdog(POLICY)
+    first.assess(observe(0.0, LATCHED))
+    second = Watchdog(POLICY)
+    second.restore(first.snapshot())
+    assert second.assess(observe(600.0, HEALTHY)).latch_cleared_after == 600.0
+
+
+def test_drift_rezero_is_blocked_by_a_latched_fault() -> None:
+    from lr4_diagnostics.autoreset import WeightSample
+
+    watchdog = Watchdog(RecoveryPolicy(armed=True, rezero_armed=True))
+    watchdog.assess(observe(0.0, HEALTHY | MOTOR_TIMEOUT))
+    verdict = watchdog.assess_drift(WeightSample(at=0.0, week_start="2026-11-02", max_weight=25.0))
+    assert not verdict.should_act
+    assert verdict.blocked_by is not None and "hardware fault" in verdict.blocked_by

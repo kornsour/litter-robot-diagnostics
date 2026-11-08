@@ -5,6 +5,21 @@ on:
   # change without any file changing, so a path-filtered push trigger alone
   # leaves no way to apply them short of an empty commit or a re-run.
   workflow_dispatch:
+  # Backstop for merges that never fire `push`. Dependabot PRs are auto-merged
+  # with GITHUB_TOKEN, and events caused by GITHUB_TOKEN start no workflow runs
+  # — so those merges to main trigger neither CI nor this deploy (PR #8 touched
+  # uv.lock on 2026-10-02 and was never deployed). A `workflow_run` on CI cannot
+  # help for the same reason: CI does not run on those merge commits either.
+  #
+  # Weekly, Tuesday, so Monday's Dependabot batch has merged by then. Scheduled
+  # runs always build the default branch. The bundle is built from `uv.lock`
+  # (see scripts/package-lambda.sh), so a run with nothing new merged
+  # rebuilds the same dependencies rather than whatever was released upstream
+  # that morning — an unattended deploy of a machine that moves must only ever
+  # ship versions that went through a PR. It also re-applies the armed flags,
+  # so a variable changed without a dispatch takes effect within a week.
+  schedule:
+    - cron: "17 9 * * 2"
   push:
     branches: [main]
     paths:
@@ -36,6 +51,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
+      # Exports the locked dependency set for the Lambda bundle. Kept current by
+      # Dependabot's github-actions group like every other action here.
+      - uses: astral-sh/setup-uv@v10
       - uses: opentofu/setup-opentofu@v2
       - uses: aws-actions/configure-aws-credentials@v6
         with:

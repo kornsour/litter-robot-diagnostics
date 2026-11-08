@@ -136,7 +136,18 @@ It detects:
 |---|---|---|
 | Cycle stall | a cycle frozen on one `robotCycleStatus`/`robotCycleState` | 5m |
 | Cycle overrun | any cycle running too long overall | 10m |
-| Idle latch | `DC_CAT_DETECT_30M` / `ROBOT_CAT_DETECT_DELAY` | 15m past the unit's own 30m threshold |
+| Idle latch | `DC_CAT_DETECT_30M` / `ROBOT_CAT_DETECT_DELAY` | 15m from the first `ROBOT_CAT_DETECT_DELAY` |
+
+The idle-latch timer starts at the first `ROBOT_CAT_DETECT_DELAY` reading, which
+is also what the unit reports during its ordinary post-visit wait. It does not
+start at the unit's own 30-minute `DC_CAT_DETECT_30M` display. With a 7-minute
+wait time and the 10-minute quiet period, a latch is acted on about 15 minutes
+after the visit began: 51 of the first 66 armed recoveries fired before the
+30-minute display ever appeared. Every latch that clears without a recovery is
+recorded as a `latch_cleared` intervention (and a `WATCHDOG_LATCH_CLEARED
+held_for=…` log line) with how long it held. That distribution is what to tune
+`--latch-grace` against: if nothing that outlasts the grace ever clears on its
+own, acting earlier costs no extra wear.
 
 The overrun ceiling exists because this unit's cycles retry rather than freeze:
 `robotCycleState` keeps flipping between `PROCESS`, `CAT_DETECT`, and `WAIT_ON`,
@@ -221,7 +232,7 @@ timeline under source `intervention` with kind `probe`.
 
 A reset can start the globe turning. The watchdog triggers on a sensor this unit
 is already known to misreport, so it can never *prove* the globe is empty — it
-can only make an occupied globe very unlikely. Six gates stand between a
+can only make an occupied globe very unlikely. Seven gates stand between a
 detection and a command, and any one of them holds it off:
 
 1. **Bonnet closed.** No command while `isBonnetRemoved` is set, or while the
@@ -231,19 +242,29 @@ detection and a command, and any one of them holds it off:
    this gate a session running past `--latch-grace` would earn a reset with the
    owner's hands in the globe. Reseating the bonnet also restarts the stuck
    timers, so time spent open cannot ripen into an immediate reset.
-2. **Persistence.** The state must outlast any plausible cat visit
+2. **No latched hardware fault.** No command while the unit reports
+   `globeMotorFaultStatus`, `retractMotorFaultStatus`, `pinchStatus` or
+   `USBFaultStatus` in anything but a clear state. A motor timeout means
+   something mechanical needs a person, and driving the globe again is how it
+   turns into wear: both globe-motor `FAULT_TIMEOUT`s on record (2026-08-14 and
+   2026-10-17) latched on the return trip of a watchdog recovery, and on
+   10-17 a second recovery then ran a full cycle on the faulted motor. A field
+   the unit omits is unknown rather than faulted, so it does not block. The
+   flag clears at the start of the unit's next own cycle, so this gate holds
+   the watchdog off until then rather than permanently.
+3. **Persistence.** The state must outlast any plausible cat visit
    (`--latch-grace`, `--stall-grace`).
-3. **Quiet period.** No `catWeight` or cat-detect row on the activity stream for
+4. **Quiet period.** No `catWeight` or cat-detect row on the activity stream for
    `--quiet-period`. A cat that walks in mid-countdown backs the watchdog off.
-4. **Clearance.** For idle latches, the top-centre ToF distance must read at or
+5. **Clearance.** For idle latches, the top-centre ToF distance must read at or
    above `--tof-clear-floor` (400mm; nominal litter is 451-454mm, a full globe
    about 441mm). An unavailable reading blocks rather than defaults open. The
    check is skipped for cycle stalls because `litterLevel` is frozen mid-cycle
    and a stale value would prove nothing.
-5. **Rate limits.** `--cooldown` between attempts and `--max-per-hour` overall.
+6. **Rate limits.** `--cooldown` between attempts and `--max-per-hour` overall.
    `validate()` rejects a `--max-per-hour` that the cooldown alone already
    satisfies, since that is not a second gate at all.
-6. **Escalation.** After `--max-consecutive-failures` failed recoveries the
+7. **Escalation.** After `--max-consecutive-failures` failed recoveries the
    watchdog stands down entirely and waits for a human — and stays down until
    the DynamoDB `STATE` item is cleared by hand, so wire up the alarm below.
 
@@ -255,6 +276,19 @@ failed recovery, and only staying healthy through `--recovery-hold` counts as a
 real one. Without this the failure counter cleared on every attempt, escalation
 was unreachable, and a persistent latch drew a reset every ~16 minutes for as
 long as it lasted.
+
+A hardware fault that appears after a recovery also makes it a failure, both
+inside the attempt (the globe parked, but with a fault, logged as
+`WATCHDOG_RECOVERY_FAULT` and recorded as `fault_after`) and in the later
+verdict. Before this, both motor timeouts on record were booked as successes.
+
+Between presses the recovery waits for the *effect* the press should have had,
+not for any change of state. A cycle retrying against a false detection changes
+`robotCycleState` by itself, so a Reset on one looked as if it had landed before
+the pause registered. The loop then stopped and left the globe paused: for 13
+minutes on 2026-08-27 and 39 on 2026-09-06. A pause that still only shows up
+after the presses have stopped is resumed during verification, within the same
+two-Reset cap.
 
 Run it unarmed first — that is the default. It performs every assessment, logs
 every decision, and records both, without sending a single command:
@@ -351,8 +385,15 @@ schedule, IAM policy, or table in the console.
 #### What CI reads, and how to arm
 
 The deploy workflow runs on pushes to `main` that touch `src/`, `infra/`,
-`scripts/package-lambda.sh`, `pyproject.toml` or `uv.lock`, and on
-`workflow_dispatch`. Settings that live outside the tree change nothing in
+`scripts/package-lambda.sh`, `pyproject.toml` or `uv.lock`, on
+`workflow_dispatch`, and weekly on Tuesday at 09:17 UTC. The schedule exists
+because Dependabot PRs are auto-merged with `GITHUB_TOKEN`, and pushes made
+with that token start no workflows, so a dependency bump would otherwise sit
+undeployed (#8 did, for five weeks). The Lambda bundle is built from `uv.lock`,
+not from the version ranges in `pyproject.toml`, and the build is reproducible,
+so a scheduled run with nothing new merged produces the same zip and changes
+nothing. An unattended deploy only ever ships versions that went through a PR.
+Settings that live outside the tree change nothing in
 `git`, so the manual trigger is how you apply them:
 
 ```bash
