@@ -24,22 +24,26 @@ Two reasons, both load-bearing:
 | Scope | Actions |
 |---|---|
 | `/aws/lambda/lr4-watchdog` log group | describe, filter, get, Insights queries |
-| `lr4-watchdog-*` alarms | `DescribeAlarms`, `DescribeAlarmHistory` |
-| `LR4Watchdog` + `AWS/Lambda` namespaces | `GetMetricStatistics`, `GetMetricData`, `ListMetrics` |
+| alarms (`*`: list calls cannot be scoped) | `DescribeAlarms`, `DescribeAlarmHistory`, `DescribeAlarmsForMetric` |
+| metrics (`*`) | `GetMetricStatistics`, `GetMetricData`, `ListMetrics` |
+| `lr4-*` EventBridge rules | `DescribeRule`, `ListTargetsByRule` (+ `ListRules` on `*`) |
+| `lr4-*` Scheduler schedules | `GetSchedule` (+ `ListSchedules` on `*`) |
+| metric filters (`*`) | `logs:DescribeMetricFilters` |
 | `lr4-watchdog` table | `DescribeTable`, `GetItem`, `BatchGetItem`, `Query`, `Scan` |
 | `lr4-watchdog` function | `GetFunctionConfiguration` |
 | `lr4-watchdog-alerts` topic | `GetTopicAttributes`, `ListSubscriptionsByTopic` |
 
-And an explicit `Deny` on Secrets Manager, on all of EventBridge, on every
+And an explicit `Deny` on Secrets Manager, on every mutating EventBridge and Scheduler verb, on every
 mutating Lambda verb, and on every DynamoDB write verb — expressed as action
-*prefixes* (`dynamodb:Put*`, `lambda:Update*`, `events:*`, …) rather than named
+*prefixes* (`dynamodb:Put*`, `lambda:Update*`, `events:Put*`, …) rather than named
 actions. An earlier version enumerated `PutItem`/`UpdateItem`/`DeleteItem` and
 left `BatchWriteItem`, `TransactWriteItems`, `DeleteRule` and `RemoveTargets`
 reachable; a deny list that has to name every verb rots as AWS adds APIs.
 
 None of those prefixes collide with the allows above: the DynamoDB reads are
 `Describe`/`Get`/`BatchGet`/`Query`/`Scan`, Lambda is `Get` only, and
-EventBridge is not granted at all.
+EventBridge/Scheduler reads are `Describe`/`List`/`Get`. (A blanket `events:*` deny
+used to block the trigger reads; it is now per-prefix.)
 
 Nothing in the allow list grants any of it; the deny is there so a later edit
 cannot introduce them by accident.

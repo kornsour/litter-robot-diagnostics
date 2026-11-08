@@ -42,6 +42,7 @@ from .autoreset import (
     _record_drift,
     _recover,
     _rezero_scale,
+    log_latch_cleared,
     log_scale_drift,
     log_stuck,
 )
@@ -251,6 +252,9 @@ async def _run_once() -> dict[str, int]:
 
                 assessment = watchdog.assess(observation)
                 store = _DynamoInterventionStore(table, robot_id)
+                if assessment.latch_cleared_after is not None:
+                    log_latch_cleared(assessment)
+                    _record(store, robot, "latch_cleared", observation, assessment, policy)
                 if assessment.stuck:
                     _record(store, robot, "assessment", observation, assessment, policy)
                     log_stuck(assessment, policy)

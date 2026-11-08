@@ -98,6 +98,7 @@ from pylitterbot.event import EVENT_UPDATE
 
 from .auth import load_token, resolve_password, save_token
 from .capture import _isolated_botocore_configuration
+from .faults import CLEAR_VALUES, FAULT_FIELDS
 from .queries import GraphQLQueryError, fetch_summary
 from .redact import pseudonym
 from .sensors import number
@@ -106,9 +107,11 @@ from .subscriptions import stream_activity
 
 _LOGGER = logging.getLogger(__name__)
 
-#: ``displayCode``/``robotStatus`` values for the >30-minute scale latch. The
+#: ``displayCode``/``robotStatus`` values for an at-rest cat-detect latch. The
 #: unit sits at home reporting a cat that never leaves, so the wait timer never
-#: elapses and no cycle runs at all.
+#: elapses and no cycle runs at all. ``ROBOT_CAT_DETECT_DELAY`` is also what the
+#: unit reports during an ordinary post-visit wait, so `latch_grace` -- not this
+#: set -- is what separates a latch from a visit; see its comment.
 LATCH_DISPLAY_CODES = frozenset({"DC_CAT_DETECT_30M"})
 LATCH_ROBOT_STATUSES = frozenset({"ROBOT_CAT_DETECT_DELAY"})
 
@@ -147,10 +150,16 @@ CLEAN_CYCLE = "clean_cycle"
 class RecoveryPolicy:
     """Thresholds and limits governing when the watchdog may act."""
 
-    #: Extra time to wait after the unit reports the >30-minute latch. The
-    #: latch already implies 30 minutes of no usable box, so the default puts
-    #: intervention at roughly the 45-minute mark. Every latch observed so far
-    #: eventually self-resolved, but they ran 0.8h to 8.2h.
+    #: How long the unit may sit in an at-rest cat-detect state before it
+    #: counts as latched. Measured from the *first* ``ROBOT_CAT_DETECT_DELAY``
+    #: reading -- the same status the unit reports during its ordinary
+    #: post-visit wait timer -- not from the unit's own ``DC_CAT_DETECT_30M``
+    #: latch. With this unit's 7-minute wait time and the 10-minute
+    #: `quiet_period`, the default acts about 15 minutes after the visit began,
+    #: well before the 30-minute display appears: 51 of the first 66 armed
+    #: recoveries fired on plain ``DC_CAT_DETECT``. Latches that clear on their
+    #: own are recorded as ``latch_cleared`` interventions with how long they
+    #: held, which is the data needed to decide whether this should be longer.
     latch_grace: float = 900.0
     #: How long a cycle may sit on an unchanged state before it counts as
     #: stalled. Healthy cycles finish in 2.2m, aborting ones in 3.4m, and the
@@ -271,6 +280,11 @@ class Observation:
     #: ``None`` when the unit did not report the bonnet sensor at all, which is
     #: treated as "not known to be closed" rather than as closed.
     bonnet_removed: bool | None = None
+    #: Latched hardware fault flags the unit reported in a non-clear state, as
+    #: ``(field, value)`` pairs. Only reported fields count: an omitted field is
+    #: unknown, and blocking on it would stand the watchdog down whenever the
+    #: cloud payload dropped a key.
+    faults: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def from_state(cls, at: float, payload: dict[str, Any]) -> Observation:
@@ -283,7 +297,21 @@ class Observation:
             cycle_state=_text(payload.get("robotCycleState")),
             litter_level_mm=number(payload.get("litterLevel")),
             bonnet_removed=_flag(payload.get("isBonnetRemoved")),
+            faults=tuple(
+                (name, value)
+                for name in FAULT_FIELDS
+                if isinstance(value := payload.get(name), str)
+                and value
+                and value not in CLEAR_VALUES
+            ),
         )
+
+    @property
+    def fault_summary(self) -> str | None:
+        """The latched faults as ``field=value`` text, or None when clear."""
+        if not self.faults:
+            return None
+        return ", ".join(f"{name}={value}" for name, value in self.faults)
 
     @property
     def bonnet_secure(self) -> bool:
@@ -348,16 +376,24 @@ class Assessment:
     stuck_for: float = 0.0
     should_act: bool = False
     blocked_by: str | None = None
+    #: Set on the observation where an at-rest latch cleared with no recovery
+    #: in between: how long it had held, in seconds. This is the only window
+    #: on how long latches last when left alone, which is what `latch_grace`
+    #: should be tuned against now that the watchdog truncates them.
+    latch_cleared_after: float | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Render for the intervention log."""
-        return {
+        payload: dict[str, Any] = {
             "stuck": self.stuck,
             "reason": self.reason,
             "stuck_for_seconds": round(self.stuck_for, 1),
             "should_act": self.should_act,
             "blocked_by": self.blocked_by,
         }
+        if self.latch_cleared_after is not None:
+            payload["latch_cleared_after_seconds"] = round(self.latch_cleared_after, 1)
+        return payload
 
 
 class Watchdog:
@@ -376,6 +412,7 @@ class Watchdog:
         self.policy = policy
         self._now = now
         self._latched_since: float | None = None
+        self._latch_cleared_after: float | None = None
         self._cycling_since: float | None = None
         self._progress_key: tuple[str | None, str | None] | None = None
         self._progress_since: float | None = None
@@ -519,6 +556,7 @@ class Watchdog:
     def assess(self, observation: Observation) -> Assessment:
         """Fold one observation into the state machine and return a verdict."""
         self._last_observation = observation
+        self._latch_cleared_after = None
         self._track_service(observation)
         self._track_latch(observation)
         self._track_progress(observation)
@@ -526,7 +564,7 @@ class Watchdog:
         reason, stuck_for = self._stuck_reason(observation)
         self._judge_pending_recovery(observation, reason)
         if reason is None:
-            return Assessment(stuck=False)
+            return Assessment(stuck=False, latch_cleared_after=self._latch_cleared_after)
         blocked_by = self._blocked_by(observation, reason)
         return Assessment(
             stuck=True,
@@ -534,6 +572,7 @@ class Watchdog:
             stuck_for=stuck_for,
             should_act=blocked_by is None,
             blocked_by=blocked_by,
+            latch_cleared_after=self._latch_cleared_after,
         )
 
     def _judge_pending_recovery(self, observation: Observation, reason: str | None) -> None:
@@ -552,7 +591,12 @@ class Watchdog:
         """
         if not self._awaiting_verdict or self._last_attempt is None:
             return
-        if reason is not None:
+        # A hardware fault raised after the globe was driven is the clearest
+        # wear signal this unit gives: both globe-motor FAULT_TIMEOUTs on
+        # record (2026-08-14, 2026-10-17) latched on the return trip of a
+        # watchdog recovery, and both were booked as successes because the
+        # unit then sat idle at home.
+        if reason is not None or observation.faults:
             self._awaiting_verdict = False
             self._consecutive_failures += 1
         elif (
@@ -584,6 +628,11 @@ class Watchdog:
             if self._latched_since is None:
                 self._latched_since = observation.at
         else:
+            # Any latch still being timed here cleared without a recovery:
+            # `note_attempt` and a bonnet reseat both drop the timer, so what
+            # survives to this point is the unit releasing on its own.
+            if self._latched_since is not None:
+                self._latch_cleared_after = observation.at - self._latched_since
             self._latched_since = None
 
     def _track_progress(self, observation: Observation) -> None:
@@ -622,6 +671,13 @@ class Watchdog:
             if observation.bonnet_removed is None:
                 return "bonnet state unavailable"
             return "bonnet removed, someone is at the unit"
+
+        # A latched motor or pinch fault means something mechanical needs a
+        # person to look at it. Driving the globe again is how a timeout turns
+        # into wear: on 2026-10-17 a second recovery ran a full cycle on a
+        # globe motor that had latched FAULT_TIMEOUT an hour earlier.
+        if observation.faults:
+            return f"hardware fault latched ({observation.fault_summary}), needs a human"
 
         if self.escalated:
             return f"escalated after {self._consecutive_failures} consecutive failures"
@@ -693,6 +749,8 @@ class Watchdog:
             return "bonnet removed, someone is at the unit"
         if not self._last_observation.is_healthy:
             return "unit not idle at home"
+        if self._last_observation.faults:
+            return f"hardware fault latched ({self._last_observation.fault_summary})"
 
         if self.rezero_escalated:
             failures = self._rezero_consecutive_failures
@@ -876,6 +934,9 @@ async def _watch_loop(
 
             observation = Observation.from_state(monotonic(), robot.to_dict())
             assessment = watchdog.assess(observation)
+            if assessment.latch_cleared_after is not None:
+                log_latch_cleared(assessment)
+                _record(store, robot, "latch_cleared", observation, assessment, policy)
             _announce(robot, assessment, announced)
             if not assessment.stuck:
                 continue
@@ -997,14 +1058,10 @@ async def _recover(
             command = next_recovery_command(assessment.reason, current, sent=dispatched)
             if command is None:
                 break
-            if command == RESET:
-                await robot.reset()
-            else:
-                await robot.start_cleaning()
+            await _dispatch(robot, command)
             dispatched.append(command)
-            current = await _observe_after_command(robot, policy, current)
+            current = await _observe_after_command(robot, policy, current, command)
 
-        steps["commands"] = list(dispatched)
         steps["state_after_commands"] = {
             "robot_status": current.robot_status,
             "display_code": current.display_code,
@@ -1012,7 +1069,13 @@ async def _recover(
             "cycling": current.is_cycling,
             "home": current.is_healthy,
         }
-        succeeded = await _wait_for_recovery(robot, policy)
+        succeeded, final = await _wait_for_recovery(robot, policy, dispatched)
+        steps["commands"] = list(dispatched)
+        if final is not None and final.faults:
+            # Reported separately from `succeeded` so the record says *why*:
+            # the globe got home, but the motor timed out getting there.
+            steps["fault_after"] = final.fault_summary
+            _LOGGER.error("WATCHDOG_RECOVERY_FAULT %s", final.fault_summary)
     except Exception as exc:  # noqa: BLE001 - a failed recovery is data, not a crash
         _LOGGER.error("Recovery attempt failed: %s", type(exc).__name__)
         steps["commands"] = list(dispatched)
@@ -1301,6 +1364,16 @@ def log_stuck(assessment: Assessment, policy: RecoveryPolicy) -> None:
     )
 
 
+def log_latch_cleared(assessment: Assessment) -> None:
+    """Emit the marker for an at-rest latch that released without a recovery.
+
+    Most of these are ordinary visits: the unit reports the same status during
+    its post-visit wait timer. The distribution of ``held_for`` is what shows
+    whether any latch past `latch_grace` would have cleared on its own.
+    """
+    _LOGGER.info("WATCHDOG_LATCH_CLEARED held_for=%.0fs", assessment.latch_cleared_after or 0.0)
+
+
 def log_scale_drift(assessment: Assessment, sample: WeightSample, policy: RecoveryPolicy) -> None:
     """Emit the alarm line for weight drift, whatever the watchdog does next.
 
@@ -1379,14 +1452,45 @@ def _state_key(observation: Observation) -> tuple[object, ...]:
     )
 
 
-async def _observe_after_command(
-    robot: LitterRobot4, policy: RecoveryPolicy, before: Observation
-) -> Observation:
-    """Poll until the state actually moves, or ``settle`` elapses.
+async def _dispatch(robot: LitterRobot4, command: str) -> None:
+    if command == RESET:
+        await robot.reset()
+    else:
+        await robot.start_cleaning()
 
-    Waiting for a *change* rather than for a fixed pause matters: read too
+
+def command_landed(command: str, before: Observation, after: Observation) -> bool:
+    """Whether ``after`` shows the effect ``command`` should have had on ``before``.
+
+    A bare "something changed" test is not enough. A cycle retrying against a
+    false detection flips `robotCycleState` on its own, so a Reset pressed on
+    one looked as if it had landed the moment the cycle churned, the loop
+    stopped before the pause registered, and the globe sat paused until the
+    next recovery found it -- 13 minutes on 2026-08-27, 39 on 2026-09-06.
+    """
+    if after.is_healthy:
+        return True
+    if command == RESET:
+        if before.is_paused:
+            return not after.is_paused
+        if before.is_cycling:
+            return after.is_paused or not after.is_cycling
+        if before.is_latched:
+            return not after.is_latched
+    elif command == CLEAN_CYCLE and not before.is_cycling:
+        return after.is_cycling
+    return _state_key(after) != _state_key(before)
+
+
+async def _observe_after_command(
+    robot: LitterRobot4, policy: RecoveryPolicy, before: Observation, command: str
+) -> Observation:
+    """Poll until the command's expected effect shows, or ``settle`` elapses.
+
+    Waiting for the *effect* rather than for a fixed pause matters: read too
     early and a Reset that has not landed yet still looks like a pause, so the
-    loop would press Reset again and re-pause the cycle it just resumed.
+    loop would press Reset again and re-pause the cycle it just resumed. See
+    `command_landed` for why any state change is not the same thing.
     """
     deadline = monotonic() + policy.settle
     observation = before
@@ -1398,7 +1502,7 @@ async def _observe_after_command(
             _LOGGER.debug("Settle refresh failed (%s).", type(exc).__name__)
         else:
             observation = Observation.from_state(monotonic(), robot.to_dict())
-            if observation.is_healthy or _state_key(observation) != _state_key(before):
+            if command_landed(command, before, observation):
                 break
         # Always look at least once: dispatching a command and never checking
         # what it did is how the loop ends up deciding its next press from a
@@ -1408,19 +1512,50 @@ async def _observe_after_command(
     return observation
 
 
-async def _wait_for_recovery(robot: LitterRobot4, policy: RecoveryPolicy) -> bool:
-    """Poll until the unit parks at home cleanly, or the timeout elapses."""
+async def _wait_for_recovery(
+    robot: LitterRobot4, policy: RecoveryPolicy, dispatched: list[str]
+) -> tuple[bool, Observation | None]:
+    """Poll until the unit parks at home cleanly, or the timeout elapses.
+
+    Returns whether it did, and the last observation read. A unit at home with
+    a latched hardware fault has not recovered cleanly and returns False.
+
+    A pause that registers only after the press loop has stopped is resumed
+    here, within the same two-Reset and `max_recovery_steps` caps the loop
+    obeys: left alone it strands the globe mid-dump until the next recovery.
+    ``dispatched`` is extended in place with any such press.
+    """
     deadline = monotonic() + policy.verify_timeout
-    while monotonic() < deadline:
+    last: Observation | None = None
+    parked_with_fault = 0
+    while True:
         await asyncio.sleep(min(policy.poll_interval, max(0.0, deadline - monotonic())))
         try:
             await robot.refresh()
         except Exception as exc:  # noqa: BLE001 - keep polling through transient errors
             _LOGGER.debug("Verification refresh failed (%s).", type(exc).__name__)
-            continue
-        if Observation.from_state(monotonic(), robot.to_dict()).is_healthy:
-            return True
-    return False
+        else:
+            last = Observation.from_state(monotonic(), robot.to_dict())
+            if last.is_healthy:
+                if not last.faults:
+                    return True, last
+                # Parked, but with a fault latched on the way. Confirm it on a
+                # second read rather than the first, then stop: the park is
+                # not going to un-fault itself, and holding the lease for the
+                # rest of `verify_timeout` only blinds the invocations behind.
+                parked_with_fault += 1
+                if parked_with_fault >= 2:
+                    return False, last
+            elif (
+                last.is_paused
+                and dispatched.count(RESET) < 2
+                and len(dispatched) < policy.max_recovery_steps
+            ):
+                await _dispatch(robot, RESET)
+                dispatched.append(RESET)
+        if monotonic() >= deadline:
+            break
+    return (last is not None and last.is_healthy and not last.faults), last
 
 
 def _announce(
@@ -1468,6 +1603,7 @@ def _record(
             "cycle_state": observation.cycle_state,
             "litter_level_mm": observation.litter_level_mm,
             "bonnet_removed": observation.bonnet_removed,
+            "faults": dict(observation.faults),
         },
         "assessment": assessment.to_payload(),
     }
