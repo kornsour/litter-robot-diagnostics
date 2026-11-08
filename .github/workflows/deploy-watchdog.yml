@@ -52,8 +52,10 @@ jobs:
         with:
           python-version: "3.14"
       # Exports the locked dependency set for the Lambda bundle. Kept current by
-      # Dependabot's github-actions group like every other action here.
-      - uses: astral-sh/setup-uv@v10
+      # Dependabot's github-actions group like every other action here. Exact
+      # version, not `@v10`: setup-uv publishes no floating major tag, and the
+      # first deploy with `@v10` failed to resolve the action at all.
+      - uses: astral-sh/setup-uv@v10.3.3
       - uses: opentofu/setup-opentofu@v2
       - uses: aws-actions/configure-aws-credentials@v6
         with:
