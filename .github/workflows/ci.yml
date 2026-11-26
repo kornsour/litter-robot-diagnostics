@@ -15,8 +15,8 @@ concurrency:
 jobs:
   ci:
     # Centralized, standardized CI shared across the Python template-derived
-    # repos. See github.com/kornsour/gh-automation.
-    uses: kornsour/gh-automation/.github/workflows/python-ci.yml@8389ab51e28c3c75507f88009b78bf387ca811b1 # python-ci.yml pinned 2026-09-06
+    # repos. See github.com/lurking-walrus/gh-automation.
+    uses: lurking-walrus/gh-automation/.github/workflows/python-ci.yml@9755c5a968c76d19c7f54017d4bcd1b314810426 # main 2026-11-26
     with:
       python-version: "3.14"
       validate-opentofu: true

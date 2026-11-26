@@ -47,17 +47,17 @@ jobs:
     # fork PR on a public repo must never reach a self-hosted runner.
     runs-on: ${{ fromJSON(vars.USE_SELF_HOSTED_RUNNER == 'true' && github.event.repository.private && '["self-hosted","Linux"]' || '["ubuntu-latest"]') }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.14"
       # Exports the locked dependency set for the Lambda bundle. Kept current by
       # Dependabot's github-actions group like every other action here. Exact
       # version, not `@v10`: setup-uv publishes no floating major tag, and the
       # first deploy with `@v10` failed to resolve the action at all.
-      - uses: astral-sh/setup-uv@v10.4.0
-      - uses: opentofu/setup-opentofu@v2
-      - uses: aws-actions/configure-aws-credentials@v6
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+      - uses: aws-actions/configure-aws-credentials@45666896f5d8e0f10ae255413f3a4cdd03bdc8f5 # v6
         with:
           # Contains the AWS account ID, so it is a repository secret rather
           # than a literal. Not a credential — assuming it still requires an
